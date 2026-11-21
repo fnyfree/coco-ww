@@ -4,7 +4,7 @@ from pathlib import Path
 
 from ok import Box, ConfigOption, Icon
 from ok.util.GlobalConfig import create_basic_options
-from src.foreground_input import Pynput
+from src.foreground_input import Pynput, SendInput
 from src.game_launcher import get_game_launch_arguments
 from src.task.process_feature import process_feature
 from src.task.task_icons import task_icon
@@ -216,8 +216,9 @@ config = {
         'launch_arguments': get_game_launch_arguments,
         'exe': 'Client-Win64-Shipping.exe',
         'hwnd_class': 'UnrealWindow',
-        # 默认后台 PostMessage; Pynput 是前台 SendInput (同上游 v3.8.3), 见 src/foreground_input.py
-        'interaction': ['PostMessage', Pynput],
+        # 默认后台 PostMessage; SendInput 和 Pynput 都是前台系统输入, SendInput 是 coco-ww 自己写的 (试用中),
+        # Pynput 同上游 v3.8.3, 留着对比。见 src/foreground_input.py
+        'interaction': ['PostMessage', SendInput, Pynput],
         'capture_method': ['WGC', 'WGC_HDR','BitBlt_RenderFull'],  # Windows版本支持的话, 优先使用WGC, 否则使用BitBlt_Full
         'check_hdr': False,
         'force_no_hdr': False,

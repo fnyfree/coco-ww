@@ -57,7 +57,7 @@ BLUR_DOWNSCALE = 18
 REFRESH_MS = 1000
 LAST_RUN_CACHE_SECONDS = 15
 
-INTERACTION_NAMES = {'Pynput': '前台输入', 'PostMessage': '后台输入'}
+INTERACTION_NAMES = {'SendInput': '前台输入', 'Pynput': '前台输入 (Pynput)', 'PostMessage': '后台输入'}
 NO_TELEPORT = 'No'
 
 

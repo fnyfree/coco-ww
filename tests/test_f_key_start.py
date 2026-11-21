@@ -283,8 +283,9 @@ class ForegroundInputTest(unittest.TestCase):
 
     def test_config_offers_both_input_methods(self):
         from config import config
-        from src.foreground_input import Pynput
-        self.assertEqual(config['windows']['interaction'], ['PostMessage', Pynput], '默认仍是后台 PostMessage')
+        from src.foreground_input import Pynput, SendInput
+        self.assertEqual(config['windows']['interaction'], ['PostMessage', SendInput, Pynput],
+                         '默认仍是后台 PostMessage')
 
 
 class CompatShellTest(unittest.TestCase):

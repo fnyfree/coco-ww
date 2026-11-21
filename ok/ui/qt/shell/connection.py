@@ -32,6 +32,16 @@ def _method_name(method) -> str:
     return method.__name__ if isinstance(method, type) else str(method)
 
 
+def interaction_label(method) -> str:
+    """Translated label of an interaction method; untranslated classes fall back to their ``ui_label``."""
+
+    name = _method_name(method)
+    label = _t("SelectInteractionListView", name)
+    if label == name:
+        label = getattr(method, 'ui_label', None) or name
+    return label
+
+
 def split_label(label: str):
     """Split a translated "Name - description" label into its two parts."""
 
@@ -98,7 +108,7 @@ def interaction_options(device_manager, device: dict):
         if not methods:
             return [(_t("SelectInteractionListView", "WindowsInteraction"), "", None)], 0, [None]
         names = [_method_name(method) for method in methods]
-        options = [split_label(_t("SelectInteractionListView", name)) for name in names]
+        options = [split_label(interaction_label(method)) for method in methods]
         current = device_manager.config.get("interaction")
         index = names.index(current) if current in names else 0
         return [(title, description, None) for title, description in options], index, names
