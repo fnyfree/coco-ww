@@ -6,7 +6,9 @@ is_greater_version), 所以在这里用 GitHub Release 实现它们, 界面代�
 
 更新方式是增量的:
 - 每个 Release 带一个 update-manifest.json 附件, 列出那个提交里每个 git 跟踪文件的 SHA256;
-- 点更新时拿它和本地文件逐个比哈希, 只从 raw.githubusercontent.com 按提交号下载变了的文件,
+- 版本列表和这些清单, 发版 Action 也会放一份到 update-index 分支 (tools/release_index.py)。先从
+  raw / jsDelivr 读这个分支, 国内不用连 GitHub 接口; 都读不到才退回 GitHub 接口 + Release 附件;
+- 点更新时拿清单和本地文件逐个比哈希, 只按提交号下载变了的文件 (raw / jsDelivr 哪个连得上用哪个),
   先放进 cache/update/<版本>/files, 全部校验通过才动手;
 - 程序退出后由 apply_update.py 换文件 (失败整批回滚), 再按原命令行重启。
 
@@ -25,11 +27,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from http.client import HTTPException
 from pathlib import Path, PurePosixPath
-from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
 from urllib.request import Request
 
 from src.net_ssl import open_url
@@ -51,14 +55,30 @@ REPO = "wk321425/coco-ww"
 API_RELEASES = f"https://api.github.com/repos/{REPO}/releases?per_page=50"
 MANIFEST_ASSET = "update-manifest.json"
 MANIFEST_FORMAT = 1
+# 发版 Action 推的版本列表 (tools/release_index.py)。同一份内容的几个入口, 按顺序试:
+# raw 最新 (缓存 5 分钟), 国内常连不上; jsDelivr 国内能连, 分支内容缓存 12 小时, 发版后 Action 会刷新。
+# 清单按 releases.json 里写的提交号取, 不受分支缓存影响。
+INDEX_BRANCH = "update-index"
+INDEX_FILE = "releases.json"
+INDEX_FORMAT = 1
+INDEX_SOURCES = (
+    "https://raw.githubusercontent.com/{repo}/{ref}/{path}",
+    "https://cdn.jsdelivr.net/gh/{repo}@{ref}/{path}",
+    "https://fastly.jsdelivr.net/gh/{repo}@{ref}/{path}",
+)
 # 按顺序试; 每个文件都按清单里的 SHA256 校验, 所以备用源只管能不能下到
 FILE_SOURCES = (
     "https://raw.githubusercontent.com/{repo}/{commit}/{path}",
     "https://cdn.jsdelivr.net/gh/{repo}@{commit}/{path}",
+    "https://fastly.jsdelivr.net/gh/{repo}@{commit}/{path}",
 )
 USER_AGENT = "coco-ww-updater"
 TIMEOUT = 20
+META_TIMEOUT = 8  # 版本列表和清单都不大, 连不上的入口早点放弃
+SOURCE_PENALTY = 600  # 连不上的源 10 分钟内排到最后, 免得每个文件都先等它超时
 DOWNLOAD_WORKERS = 6
+# 连不上、超时、证书问题、连接中途断开
+NETWORK_ERRORS = (OSError, HTTPException)
 
 APP_ROOT = Path(__file__).resolve().parent.parent
 STAGING_ROOT = APP_ROOT / "cache" / "update"
@@ -70,6 +90,9 @@ FORBIDDEN_PREFIXES = ("python/", ".git/", "cache/", "logs/")
 
 # get_version_list 拉到的全部 Release (含测试版), 按 tag 存, 给 update_to_version 用
 _releases = {}
+# 最近连不上的源 (host -> time.monotonic()), 几个下载线程共用
+_failed_hosts = {}
+_failed_lock = threading.Lock()
 
 
 def hide_pyappify():
@@ -118,11 +141,11 @@ def installed_version():
 
 # --- 网络 ---------------------------------------------------------------------
 
-def _open(url, accept=None):
+def _open(url, accept=None, timeout=TIMEOUT):
     headers = {"User-Agent": USER_AGENT}
     if accept:
         headers["Accept"] = accept
-    return open_url(Request(url, headers=headers), timeout=TIMEOUT)
+    return open_url(Request(url, headers=headers), timeout=timeout)
 
 
 def _get_json(url, accept=None):
@@ -133,13 +156,66 @@ def _get_json(url, accept=None):
         if error.code in (403, 429) and "api.github.com" in url:
             raise RuntimeError("GitHub 接口访问太频繁被限流了，过一小时再试") from error
         raise RuntimeError(f"访问 {url} 失败: HTTP {error.code}") from error
-    except OSError as error:
-        raise RuntimeError(f"连不上 GitHub（国内网络需要自己挂代理）: {error}") from error
+    except NETWORK_ERRORS as error:
+        raise RuntimeError(f"连不上 GitHub: {_reason(error)}") from error
 
 
 def _download_bytes(url):
     with _open(url) as response:
         return response.read()
+
+
+def _host(url):
+    return urlsplit(url).netloc
+
+
+def _reason(error):
+    if isinstance(error, HTTPError):
+        return f"HTTP {error.code}"
+    if isinstance(error, URLError):
+        return str(error.reason)
+    return str(error) or type(error).__name__
+
+
+def _ordered(urls):
+    """最近连不上的源排到最后, 其余保持原来的顺序。"""
+    now = time.monotonic()
+    with _failed_lock:
+        down = {host for host, at in _failed_hosts.items() if now - at < SOURCE_PENALTY}
+    return sorted(urls, key=lambda url: _host(url) in down)
+
+
+def _note_result(url, error=None):
+    """记下这个源连不连得上。HTTP 错误说明服务器是通的 (只是没这个文件), 不算连不上。"""
+    with _failed_lock:
+        if error is None or isinstance(error, HTTPError):
+            _failed_hosts.pop(_host(url), None)
+        else:
+            _failed_hosts[_host(url)] = time.monotonic()
+
+
+def _fetch_first(urls, parse, accept=None, timeout=META_TIMEOUT):
+    """几个入口挨个试, 返回 (第一个取到且 parse 通过的结果, 它的 url)。
+
+    parse 抛 ValueError / RuntimeError 算这个入口的内容不对, 换下一个。都不行抛 RuntimeError, 带上每个入口的错。
+    """
+    errors = []
+    for url in _ordered(urls):
+        try:
+            with _open(url, accept, timeout) as response:
+                raw = response.read()
+        except NETWORK_ERRORS as error:
+            _note_result(url, error)
+            if isinstance(error, HTTPError):
+                error.close()
+            errors.append(f"{_host(url)} {_reason(error)}")
+            continue
+        _note_result(url)
+        try:
+            return parse(json.loads(raw.decode("utf-8"))), url
+        except (ValueError, RuntimeError) as error:
+            errors.append(f"{_host(url)} 内容不对: {error}")
+    raise RuntimeError("；".join(errors) or "没有可用的入口")
 
 
 # --- 更新说明 -----------------------------------------------------------------
@@ -201,6 +277,59 @@ def _manifest_url(release):
     return None
 
 
+_INDEX_MANIFEST = re.compile(r"manifests/[A-Za-z0-9][A-Za-z0-9._-]*\.json")
+_COMMIT = re.compile(r"[0-9a-f]{40}")
+
+
+def _is_version(tag):
+    from ok.util.version import compare_versions
+    try:
+        compare_versions(tag, tag)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _entry(tag, body, prerelease, published_at, manifest_urls):
+    return {
+        "version": tag,
+        "kind": "tag",
+        "update_note": release_notes(body),
+        "prerelease": bool(prerelease),
+        "published_at": published_at,
+        "manifest_urls": manifest_urls,
+    }
+
+
+def _index_releases(index):
+    """update-index 分支的 releases.json -> 版本表。格式不对抛 ValueError, 换下一个入口。"""
+    if (not isinstance(index, dict) or index.get("format") != INDEX_FORMAT
+            or not isinstance(index.get("releases"), list)):
+        raise ValueError("版本列表格式不对")
+    releases = {}
+    for item in index["releases"]:
+        if not isinstance(item, dict):
+            continue
+        tag, path, ref = item.get("version"), item.get("manifest"), item.get("manifest_ref")
+        if (not isinstance(tag, str) or not _is_version(tag) or not isinstance(path, str)
+                or not _INDEX_MANIFEST.fullmatch(path) or not _COMMIT.fullmatch(str(ref))):
+            continue
+        urls = [template.format(repo=REPO, ref=ref, path=path) for template in INDEX_SOURCES]
+        if isinstance(item.get("manifest_url"), str):
+            urls.append(item["manifest_url"])  # Release 附件, 最后才试
+        releases[tag] = _entry(tag, item.get("body"), item.get("prerelease"), item.get("published_at"), urls)
+    if not releases:
+        raise ValueError("版本列表是空的")
+    return releases
+
+
+def _fetch_index():
+    urls = [template.format(repo=REPO, ref=INDEX_BRANCH, path=INDEX_FILE) for template in INDEX_SOURCES]
+    releases, url = _fetch_first(urls, _index_releases)
+    _log().info("coco-ww update: version list from %s", url)
+    return releases
+
+
 def _fetch_releases():
     data = _get_json(API_RELEASES, accept="application/vnd.github+json")
     if not isinstance(data, list):
@@ -210,27 +339,29 @@ def _fetch_releases():
         tag = release.get("tag_name")
         manifest_url = _manifest_url(release)
         # 没清单的老版本 (v1.0.1 及更早) 只能手动下整包, 不列出来
-        if release.get("draft") or not tag or not manifest_url:
+        if release.get("draft") or not tag or not manifest_url or not _is_version(tag):
             continue
-        try:
-            from ok.util.version import compare_versions
-            compare_versions(tag, tag)
-        except ValueError:
-            continue
-        releases[tag] = {
-            "version": tag,
-            "kind": "tag",
-            "update_note": release_notes(release.get("body")),
-            "prerelease": bool(release.get("prerelease")),
-            "published_at": release.get("published_at"),
-            "manifest_url": manifest_url,
-        }
+        releases[tag] = _entry(tag, release.get("body"), release.get("prerelease"),
+                               release.get("published_at"), [manifest_url])
     return releases
+
+
+def _fetch_versions():
+    try:
+        return _fetch_index()
+    except RuntimeError as index_error:
+        _log().warning("coco-ww update: update index unavailable (%s), trying GitHub API", index_error)
+        try:
+            return _fetch_releases()
+        except RuntimeError as api_error:
+            raise RuntimeError(
+                "取不到版本列表，jsDelivr 和 GitHub 都连不上，过几分钟再试，还不行就挂代理。"
+                f"（{index_error}；{api_error}）") from api_error
 
 
 def get_version_list(release_only=True, exit_event=None, **_kwargs):
     global _releases
-    _releases = _fetch_releases()
+    _releases = _fetch_versions()
     versions = [item for item in _releases.values() if not (release_only and item["prerelease"])]
     versions.sort(key=functools.cmp_to_key(_version_desc))
     _log().info("coco-ww update: %d versions %s", len(versions), [v["version"] for v in versions])
@@ -261,18 +392,27 @@ def _check_path(rel):
         raise RuntimeError(f"更新清单里有不安全的路径: {rel!r}")
 
 
-def _load_manifest(entry):
-    manifest = _get_json(entry["manifest_url"])
+def _check_manifest(manifest, version):
     if not isinstance(manifest, dict):
-        raise RuntimeError(f"{entry['version']} 的更新清单格式不对")
+        raise RuntimeError(f"{version} 的更新清单格式不对")
     files = manifest.get("files")
-    if (manifest.get("format") != MANIFEST_FORMAT or manifest.get("version") != entry["version"]
-            or not re.fullmatch(r"[0-9a-f]{40}", str(manifest.get("commit", ""))) or not isinstance(files, dict)):
-        raise RuntimeError(f"{entry['version']} 的更新清单格式不对")
+    if (manifest.get("format") != MANIFEST_FORMAT or manifest.get("version") != version
+            or not _COMMIT.fullmatch(str(manifest.get("commit", ""))) or not isinstance(files, dict)):
+        raise RuntimeError(f"{version} 的更新清单格式不对")
     for rel, info in files.items():
         _check_path(rel)
-        if not re.fullmatch(r"[0-9a-f]{64}", str(info.get("sha256", ""))):
+        if not isinstance(info, dict) or not re.fullmatch(r"[0-9a-f]{64}", str(info.get("sha256", ""))):
             raise RuntimeError(f"更新清单里 {rel} 的哈希不对")
+    return manifest
+
+
+def _load_manifest(entry):
+    version = entry["version"]
+    urls = entry.get("manifest_urls") or [entry["manifest_url"]]
+    try:
+        manifest, _url = _fetch_first(urls, lambda data: _check_manifest(data, version))
+    except RuntimeError as error:
+        raise RuntimeError(f"取不到 {version} 的更新清单: {error}") from error
     return manifest
 
 
@@ -314,19 +454,21 @@ def plan_update(target, old=None, root=None):
 def _download_file(commit, rel, sha256, dest, exit_event=None):
     if _local_sha(dest) == sha256:
         return  # 上次下到一半留下的, 直接用
+    urls = [template.format(repo=REPO, commit=commit, path=quote(rel, safe="/")) for template in FILE_SOURCES]
     last_error = None
-    for template in FILE_SOURCES:
-        url = template.format(repo=REPO, commit=commit, path=quote(rel, safe="/"))
-        for _attempt in range(2):
+    for _round in range(2):  # 每个源先各试一次, 都不行再来一轮
+        for url in _ordered(urls):
             if exit_event is not None and exit_event.is_set():
                 raise RuntimeError("已取消")
             try:
                 data = _download_bytes(url)
-            except OSError as error:
+            except NETWORK_ERRORS as error:
+                _note_result(url, error)
                 if isinstance(error, HTTPError):
                     error.close()
                 last_error = error
                 continue
+            _note_result(url)
             if hashlib.sha256(data).hexdigest() != sha256:
                 last_error = RuntimeError(f"{url} 下到的内容校验不过")
                 continue

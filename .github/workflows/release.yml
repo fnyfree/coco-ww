@@ -75,3 +75,49 @@ jobs:
           v="${{ steps.ver.outputs.version }}"
           gh release create "$v" out/update-manifest.json \
             --target "$GITHUB_SHA" --title "coco-ww $v" --notes-file out/notes.md --latest
+
+      # 国内常连不上 GitHub 接口和 Release 附件: 版本列表和清单也放到 update-index 分支, 在线更新先从
+      # raw / jsDelivr 读它 (pyappify/__init__.py)。版本号没变也跑: 手动触发就能补发, 内容没变不会多提交。
+      - name: Publish update index
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          dir="$RUNNER_TEMP/update-index"
+          git init -q "$dir"
+          # 借 actions/checkout 留下的认证头, 不用另外配 token
+          git -C "$dir" config http.https://github.com/.extraheader "$(git config --get http.https://github.com/.extraheader)"
+          git -C "$dir" config user.name "github-actions[bot]"
+          git -C "$dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$dir" remote add origin "https://github.com/$REPO.git"
+          # ls-remote: 有这个分支返回 0, 没有返回 2, 连不上之类的其它错直接失败
+          found=0
+          git -C "$dir" ls-remote --exit-code --heads origin update-index >/dev/null || found=$?
+          if [ "$found" -eq 0 ]; then
+            # 要完整历史: 下面按「最后一次改清单的提交」引用清单, 浅克隆找不准
+            git -C "$dir" fetch -q origin update-index
+            git -C "$dir" checkout -q -B update-index FETCH_HEAD
+          elif [ "$found" -eq 2 ]; then
+            # 第一次发: 分支还没有, 从空历史开始
+            git -C "$dir" symbolic-ref HEAD refs/heads/update-index
+          else
+            exit "$found"
+          fi
+          python3 tools/release_index.py manifests "$RUNNER_TEMP/releases.json" "$dir" --repo "$REPO"
+          git -C "$dir" add -A manifests
+          git -C "$dir" diff --cached --quiet || git -C "$dir" commit -q -m "update manifests"
+          # 没新清单时还是上次那个提交, releases.json 一字不差, 不会多出提交
+          ref=$(git -C "$dir" log -1 --format=%H -- manifests)
+          python3 tools/release_index.py index "$RUNNER_TEMP/releases.json" "$dir" --repo "$REPO" --manifest-ref "$ref"
+          git -C "$dir" add releases.json
+          if git -C "$dir" diff --cached --quiet; then
+            echo "版本列表没变, 不推"
+            exit 0
+          fi
+          git -C "$dir" commit -q -m "update releases.json"
+          git -C "$dir" push -q origin update-index
+          # jsDelivr 对分支内容缓存 12 小时, 推完刷掉 releases.json, 国内马上能看到新版本
+          curl -fsS -m 30 "https://purge.jsdelivr.net/gh/$REPO@update-index/releases.json" \
+            || echo "::warning::jsDelivr 缓存没刷掉, 国内用户最晚 12 小时后才看到新版本"

@@ -1,11 +1,13 @@
 """在线更新 (pyappify/__init__.py + pyappify/apply_update.py) 的离线测试。
 
-起一个本地 HTTP 服务假扮 GitHub (Release 列表、更新清单、raw 文件), 在临时目录装一份「旧版」,
+起一个本地 HTTP 服务假扮 GitHub (Release 列表、更新清单、raw 文件) 和 jsDelivr 上的 update-index 分支
+(用发版 Action 同一个 tools/release_index.py 生成), 在临时目录装一份「旧版」,
 真走一遍: 拉版本列表 → 比哈希 → 下载校验 → 助手进程换文件/删文件 → 重启带更新说明。
 
 在 coco-ww 根目录跑:  python\\python.exe -X utf8 tests\\test_online_update.py
 """
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -17,15 +19,23 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
+from urllib.error import URLError
 from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pyappify  # noqa: E402
 
+_spec = importlib.util.spec_from_file_location(
+    "release_index", Path(__file__).resolve().parent.parent / "tools" / "release_index.py")
+release_index = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(release_index)
+
 OLD_COMMIT = "a" * 40
 NEW_COMMIT = "b" * 40
 ENV_COMMIT = "c" * 40
+INDEX_REF = "d" * 40  # update-index 分支上放清单的那次提交
 
 OLD_TREE = {
     "config.py": 'version = "v1.0.0"\n',
@@ -113,6 +123,21 @@ class FakeGitHub:
                          "assets": [{"name": "update-manifest.json",
                                      "browser_download_url": f"{self.base}/m/{version}.json"}]})
 
+    def publish_index(self, releases, ref=INDEX_REF):
+        """像发版 Action 那样把清单和 releases.json 放到 update-index 分支, 挂在 /cdn/<分支或提交>/ 下。"""
+        with tempfile.TemporaryDirectory() as branch:
+            root = Path(branch)
+            added = release_index.sync_manifests(
+                releases, root, lambda tag, path: path.write_bytes(self.routes[f"/m/{tag}.json"]))
+            index = release_index.build_index(releases, root, ref, "fake/repo")
+            release_index.write_index(index, root)
+            self.routes[f"/cdn/{pyappify.INDEX_BRANCH}/{release_index.INDEX_FILE}"] = (
+                root / release_index.INDEX_FILE).read_bytes()
+            for tag in added:
+                path = release_index.manifest_path(tag)
+                self.routes[f"/cdn/{ref}/{path}"] = (root / path).read_bytes()
+        return index
+
 
 def write_tree(root, tree):
     for rel, text in tree.items():
@@ -146,6 +171,7 @@ class OnlineUpdateTest(unittest.TestCase):
         cls.github.add_release(releases, "v1.1.0", ENV_COMMIT, ENV_TREE, body="* 换了依赖", prerelease=True)
         releases.append({"tag_name": "v0.9.0", "draft": False, "prerelease": False, "body": "", "assets": []})
         cls.github.routes["/releases"] = json.dumps(releases).encode()
+        cls.index = cls.github.publish_index(releases)
 
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp(prefix="coco_update_test_"))
@@ -158,17 +184,20 @@ class OnlineUpdateTest(unittest.TestCase):
         (self.app / "src/pkg/__pycache__").mkdir()
         (self.app / "src/pkg/__pycache__/only.cpython-312.pyc").write_bytes(b"pyc")
         self.saved = {name: getattr(pyappify, name) for name in
-                      ("API_RELEASES", "FILE_SOURCES", "APP_ROOT", "STAGING_ROOT", "_releases")}
+                      ("API_RELEASES", "INDEX_SOURCES", "FILE_SOURCES", "APP_ROOT", "STAGING_ROOT", "_releases")}
         pyappify.API_RELEASES = f"{self.github.base}/releases"
+        pyappify.INDEX_SOURCES = (f"{self.github.base}/cdn/{{ref}}/{{path}}",)
         pyappify.FILE_SOURCES = (f"{self.github.base}/missing/{{commit}}/{{path}}",
                                  f"{self.github.base}/raw/{{commit}}/{{path}}")
         pyappify.APP_ROOT = self.app
         pyappify.STAGING_ROOT = self.app / "cache" / "update"
         pyappify._releases = {}
+        pyappify._failed_hosts.clear()
 
     def tearDown(self):
         for name, value in self.saved.items():
             setattr(pyappify, name, value)
+        pyappify._failed_hosts.clear()
         shutil.rmtree(self.temp, ignore_errors=True)
 
     def run_helper(self, helper, plan_path):
@@ -261,6 +290,91 @@ class OnlineUpdateTest(unittest.TestCase):
         self.github.routes["/m/bad.json"] = json.dumps(bad).encode()
         with self.assertRaisesRegex(RuntimeError, "不安全"):
             pyappify._load_manifest({"version": "v1.0.1", "manifest_url": f"{self.github.base}/m/bad.json"})
+
+    # --- update-index 分支 (国内不用连 GitHub 接口) ---------------------------------------
+
+    def test_index_used_without_github_api(self):
+        self.github.requests.clear()
+        pyappify.get_version_list(release_only=True)
+        pyappify.prepare_update("v1.0.1", restart=False)
+        self.assertNotIn("/releases", self.github.requests)
+        self.assertFalse([p for p in self.github.requests if p.startswith("/m/")])
+        self.assertIn(f"/cdn/{INDEX_REF}/manifests/v1.0.1.json", self.github.requests)
+        # 旧版清单也从分支取: 靠它认出新版删掉了哪些文件
+        self.assertIn(f"/cdn/{INDEX_REF}/manifests/v1.0.0.json", self.github.requests)
+
+    def test_falls_back_to_github_api_without_index(self):
+        pyappify.INDEX_SOURCES = (f"{self.github.base}/nothing/{{ref}}/{{path}}",)
+        self.github.requests.clear()
+        versions = pyappify.get_version_list(release_only=True)
+        self.assertEqual([v["version"] for v in versions], ["v1.0.1", "v1.0.0"])
+        plan, _plan_path, _helper = pyappify.prepare_update("v1.0.1", restart=False)
+        self.assertEqual(plan["delete"], ["src/gone.py", "src/pkg/only.py"])
+        self.assertIn("/releases", self.github.requests)
+        self.assertIn("/m/v1.0.1.json", self.github.requests)
+
+    def test_everything_down_says_so(self):
+        pyappify.INDEX_SOURCES = (f"{self.github.base}/nothing/{{ref}}/{{path}}",)
+        pyappify.API_RELEASES = f"{self.github.base}/nothing/releases"
+        with self.assertRaisesRegex(RuntimeError, "jsDelivr 和 GitHub 都连不上"):
+            pyappify.get_version_list()
+
+    def test_garbage_from_one_source_skipped(self):
+        # 比如被运营商劫持返回网页: 换下一个入口
+        self.github.routes["/junk/update-index/releases.json"] = b"<html>blocked</html>"
+        pyappify.INDEX_SOURCES = (f"{self.github.base}/junk/{{ref}}/{{path}}",
+                                  f"{self.github.base}/cdn/{{ref}}/{{path}}")
+        versions = pyappify.get_version_list(release_only=True)
+        self.assertEqual([v["version"] for v in versions], ["v1.0.1", "v1.0.0"])
+
+    def test_manifest_falls_back_to_release_asset(self):
+        key = f"/cdn/{INDEX_REF}/manifests/v1.0.1.json"
+        saved = self.github.routes.pop(key)
+        try:
+            self.github.requests.clear()
+            pyappify.get_version_list()
+            plan, _plan_path, _helper = pyappify.prepare_update("v1.0.1", restart=False)
+        finally:
+            self.github.routes[key] = saved
+        self.assertEqual(len(plan["replace"]), 5)
+        self.assertIn("/m/v1.0.1.json", self.github.requests)
+        self.assertNotIn("/releases", self.github.requests)
+
+    def test_unreachable_source_moves_to_back(self):
+        dead = "http://dead.invalid"
+        pyappify.INDEX_SOURCES = (dead + "/{ref}/{path}", f"{self.github.base}/cdn/{{ref}}/{{path}}")
+        pyappify.FILE_SOURCES = (dead + "/{commit}/{path}", f"{self.github.base}/raw/{{commit}}/{{path}}")
+        real_open = pyappify._open
+        dead_hits = []
+
+        def fake_open(url, *args, **kwargs):
+            if url.startswith(dead):
+                dead_hits.append(url)
+                raise URLError(ConnectionRefusedError(10061, "refused"))
+            return real_open(url, *args, **kwargs)
+
+        with patch.object(pyappify, "_open", fake_open):
+            pyappify.get_version_list()
+            plan, _plan_path, _helper = pyappify.prepare_update("v1.0.1", restart=False)
+        self.assertEqual(len(plan["replace"]), 5)
+        # 拉版本列表那次就记下它连不上, 两份清单和 5 个文件都没再先等它
+        self.assertEqual(len(dead_hits), 1, dead_hits)
+        cdn = f"{self.github.base}/cdn/x"
+        self.assertEqual(pyappify._ordered([dead + "/x", cdn]), [cdn, dead + "/x"])
+        # 过了 10 分钟再给它机会
+        pyappify._failed_hosts["dead.invalid"] = time.monotonic() - pyappify.SOURCE_PENALTY - 1
+        self.assertEqual(pyappify._ordered([dead + "/x", cdn]), [dead + "/x", cdn])
+
+    def test_unsafe_index_entries_dropped(self):
+        good = dict(self.index["releases"][0])
+        bad_path = dict(good, version="v2.0.0", manifest="manifests/../../evil.json")
+        bad_ref = dict(good, version="v2.0.1", manifest_ref="main")
+        releases = pyappify._index_releases({"format": 1, "releases": [good, bad_path, bad_ref, "x"]})
+        self.assertEqual(list(releases), [good["version"]])
+        urls = releases[good["version"]]["manifest_urls"]
+        self.assertEqual(urls, [f"{self.github.base}/cdn/{INDEX_REF}/{good['manifest']}", good["manifest_url"]])
+        with self.assertRaises(ValueError):
+            pyappify._index_releases({"format": 2, "releases": [good]})
 
 
 if __name__ == "__main__":
