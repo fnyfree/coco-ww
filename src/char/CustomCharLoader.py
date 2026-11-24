@@ -4,6 +4,7 @@ import inspect
 import json
 import re
 import shutil
+import symtable
 import uuid
 import zipfile
 from pathlib import Path
@@ -21,6 +22,17 @@ TEAM_CODE_MODE_IMPORT = "import"
 TEAM_CODE_MODE_BUILTIN = "builtin"
 TEAM_CODE_STATE_NONE = "none"
 TEAM_IMPORT_SUFFIX = ".import.py"
+
+# 队伍代码可以直接 import 的 coco-ww 公共模块。原版 OKWW 没有它们, 分享出去的 zip 得自包含:
+# 导出时把顶层那行 from <模块> import ... 换成模块源码 (前后加标记行); 导入时标记里那段和本地的模块
+# 一字不差, 就收回成原来那行 import —— 自己导出再导入回来还是原样, 存档比对也认得出是同一份。
+# 这些模块因此只能 import 原版 OKWW 也有的东西 (标准库、numpy、cv2), 见 src/combat/MacroKit.py 开头。
+SHARED_TEAM_MODULES = {
+    "src.combat.MacroKit": Path(__file__).resolve().parent.parent / "combat" / "MacroKit.py",
+}
+_INLINE_HEAD = "# >>>>>>>> coco-ww 分享时把 {path} 内联在这里 (原版 OKWW 没有这个模块); 在 coco-ww 里这里是:"
+_INLINE_ORIGINAL = "# >>>>>>>> "
+_INLINE_TAIL = "# <<<<<<<< 内联的 {path} 到此为止"
 
 CHARACTER_DISPLAY_NAMES = {
     "Douling": "Buling",
@@ -570,8 +582,150 @@ def export_custom_team(team, destination, name, description, author, version, al
                 code_path = get_team_import_file(class_names, class_name) if imported else folder / f"{class_name}.py"
                 if not code_path.is_file():
                     raise ValueError(f"Missing code for {get_english_char_name(class_name)}")
-                archive.write(code_path, f"{class_name}.py")
+                code = code_path.read_bytes().decode("utf-8")
+                shared = inline_shared_modules(code)
+                if shared == code:
+                    archive.write(code_path, f"{class_name}.py")
+                else:
+                    _validate_character_code(shared, class_name, code_path)
+                    archive.writestr(f"{class_name}.py", shared.encode("utf-8"))
     return archive_path
+
+
+def _shared_module_lines(module):
+    text = SHARED_TEAM_MODULES[module].read_text(encoding="utf-8")
+    return text.replace("\r\n", "\n").rstrip("\n").split("\n")
+
+
+def _shared_module_label(module):
+    return module.replace(".", "/") + ".py"
+
+
+def inline_shared_modules(code):
+    """导出用: 顶层的 from <公共模块> import ... 换成模块源码, 分享出去的代码不依赖 coco-ww。"""
+    newline = "\r\n" if "\r\n" in code else "\n"
+    lines = code.replace("\r\n", "\n").split("\n")
+    tree = ast.parse("\n".join(lines))
+    imports = [node for node in tree.body
+               if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in SHARED_TEAM_MODULES]
+    if not imports:
+        return code
+    for node in reversed(imports):
+        first, last = lines[node.lineno - 1], lines[node.end_lineno - 1]
+        rest = last.encode("utf-8")[node.end_col_offset:].decode("utf-8").strip()
+        if first.encode("utf-8")[:node.col_offset].strip() or (rest and not rest.startswith("#")):
+            raise ValueError(f"from {node.module} import ... must be on lines of its own")
+        label = _shared_module_label(node.module)
+        block = [_INLINE_HEAD.format(path=label)]
+        block += [_INLINE_ORIGINAL + line for line in lines[node.lineno - 1:node.end_lineno]]
+        block += _shared_module_lines(node.module)
+        block.append(_INLINE_TAIL.format(path=label))
+        lines[node.lineno - 1:node.end_lineno] = block
+    return newline.join(lines)
+
+
+def collapse_shared_modules(code):
+    """导入用: 内联的那段和本地的模块一字不差, 收回成原来那行 import。
+
+    对不上的 (别的版本的 coco-ww 导出的) 原样留着, 自包含照样能跑, 只是不跟着本地的模块走。
+    """
+    if _INLINE_ORIGINAL.strip() not in code:
+        return code
+    newline = "\r\n" if "\r\n" in code else "\n"
+    lines = code.replace("\r\n", "\n").split("\n")
+    for module in SHARED_TEAM_MODULES:
+        label = _shared_module_label(module)
+        head, tail = _INLINE_HEAD.format(path=label), _INLINE_TAIL.format(path=label)
+        body = _shared_module_lines(module)
+        i = 0
+        while i < len(lines):
+            if lines[i] != head:
+                i += 1
+                continue
+            j = i + 1
+            original = []
+            while j < len(lines) and lines[j].startswith(_INLINE_ORIGINAL):
+                original.append(lines[j][len(_INLINE_ORIGINAL):])
+                j += 1
+            end = j + len(body)
+            candidate = lines[:i] + original + lines[end + 1:]
+            if original and lines[j:end] == body and end < len(lines) and lines[end] == tail \
+                    and _collapse_keeps_meaning(candidate, module, original):
+                lines = candidate
+                i += len(original)
+            else:
+                i += 1
+    return newline.join(lines)
+
+
+def _top_level_bindings(tree):
+    """模块顶层 (连同顶层 try/if/with/for 里) 绑定的名字 -> 怎么绑的。"""
+    out = {}
+
+    def visit(statements):
+        for node in statements:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    out[alias.asname or alias.name.split(".")[0]] = ("import", alias.name, alias.asname)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    out[alias.asname or alias.name] = ("from", node.module, node.level, alias.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out[node.name] = ("def",)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.For, ast.With)):
+                targets = [node.target] if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.For)) else                     node.targets if isinstance(node, ast.Assign) else                     [item.optional_vars for item in node.items if item.optional_vars is not None]
+                for target in targets:
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name):
+                            out[name.id] = ("assign",)
+            if isinstance(node, (ast.Try, ast.If, ast.With, ast.For, ast.While)):
+                for field in ("body", "orelse", "finalbody"):
+                    visit(getattr(node, field, []))
+                for handler in getattr(node, "handlers", []):
+                    visit(handler.body)
+
+    visit(tree.body)
+    return out
+
+
+def _global_reads(code):
+    """代码里按全局名字读的名字 (模块顶层读的, 加上函数/类里没在本地绑定的)。函数里自己 import 的不算。"""
+    names = set()
+
+    def visit(table):
+        for symbol in table.get_symbols():
+            if symbol.is_referenced() and (table.get_type() == "module" or symbol.is_global()):
+                names.add(symbol.get_name())
+        for child in table.get_children():
+            visit(child)
+
+    visit(symtable.symtable(code, "<team code>", "exec"))
+    return names
+
+
+def _collapse_keeps_meaning(lines, module, original):
+    """内联时模块的名字和队伍代码在同一个模块里, 收回后只剩 import 出来的那几个: 两种情况下意思得一样。"""
+    try:
+        tree = ast.parse("\n".join(lines))
+        restored = ast.parse("\n".join(original)).body
+    except SyntaxError:
+        return False
+    if len(restored) != 1 or not isinstance(restored[0], ast.ImportFrom) or restored[0].module != module \
+            or restored[0].level != 0:
+        return False
+    imported = {alias.asname or alias.name for alias in restored[0].names}
+    outside = _top_level_bindings(tree)
+    loaded = _global_reads("\n".join(lines))
+    for name, how in _top_level_bindings(ast.parse("\n".join(_shared_module_lines(module)))).items():
+        if name in imported:
+            continue
+        if name in outside:
+            # 外面另绑了模块里的名字: 内联时模块里的方法看到的是外面这个。一样的 import 才不碍事
+            if how[0] != "import" or outside[name] != how:
+                return False
+        elif name in loaded:
+            return False   # 外面用了模块里没 import 出来的名字, 收回后就找不到了
+    return True
 
 
 def inspect_team_archive(archive_path):
@@ -616,6 +770,7 @@ def inspect_team_archive(archive_path):
             # Zip entries commonly use CRLF. Normalize before write_text() performs
             # the platform's newline conversion, otherwise Windows creates CRCRLF.
             code = code.replace("\r\n", "\n").replace("\r", "\n")
+            code = collapse_shared_modules(code)
             _validate_character_code(code, class_name, f"{class_name}.py")
             codes[class_name] = code
     return {"manifest": manifest, "team": class_names, "codes": codes}

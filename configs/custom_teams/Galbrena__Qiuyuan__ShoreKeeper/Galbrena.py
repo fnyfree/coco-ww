@@ -2,9 +2,10 @@ import time
 
 from src.char.Galbrena import Galbrena as NativeGalbrena
 from src.char.ShoreKeeper import ShoreKeeper as NativeShoreKeeper
+from src.combat.MacroKit import MacroKit
 
 
-class Galbrena(NativeGalbrena):
+class Galbrena(MacroKit, NativeGalbrena):
     """嘉贝莉娜 —— 嘉仇守的主C, 也是启动轮的开场。
 
     轮换环: 嘉贝莉娜 -> 守岸人 -> 仇远 -> 嘉贝莉娜。
@@ -532,24 +533,6 @@ class Galbrena(NativeGalbrena):
             self.sleep(self.BURST_TO_HEAVY)
         self.hold_heavy(self.HEAVY3_HOLD, '收尾 3 段常态重击')
         self.leave()
-
-    def macro_wait(self, sec):
-        """精确等待 —— 【不点击、不读屏】。
-
-        不走 self.sleep(): 框架的 sleep 每 0.4 秒会插一次截图 + 场景识别, 插入位置
-        不可控, 而这张宏表的容错在 ±0.05 秒级。切成小片, 片间只检查任务有没有被停用
-        (界面上的"停止"照样立刻生效)。
-        """
-        if sec <= 0:
-            self.task.executor.check_enabled(check_pause=False)
-            return
-        end = time.time() + sec
-        while True:
-            left = end - time.time()
-            if left <= 0:
-                return
-            time.sleep(min(self.MACRO_SLICE, left))
-            self.task.executor.check_enabled(check_pause=False)
 
     def play_burst_macro(self):
         """回放爆发宏 —— 强化E + R 之后的「3裂隙 3踢 1翅」, 表见 BURST_MACRO_* 的注释。

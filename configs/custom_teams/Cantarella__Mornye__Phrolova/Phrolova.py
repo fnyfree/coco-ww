@@ -7,6 +7,7 @@ from ok import Box
 
 from src.char.BaseChar import SwitchPriority
 from src.char.Phrolova import Phrolova as NativePhrolova
+from src.combat.MacroKit import MacroKit
 
 CANTARELLA_NAMES = {'char_cantarella'}
 # char_name 可能是这两个值中的任何一个: CharFactory.py 把 char_moning 和
@@ -127,7 +128,7 @@ except ImportError:
 ENABLE_POLL_INTERVAL = 0.2
 
 
-class Phrolova(NativePhrolova):
+class Phrolova(MacroKit, NativePhrolova):
     """弗坎莫队(弗洛洛/坎特蕾拉/莫宁)里的弗洛洛, 兼【整条轴的持宏者】。
 
     非本队时一行不改, 整套走原版。
@@ -1214,15 +1215,6 @@ class Phrolova(NativePhrolova):
                 team_members += 1
         return team_members == 2
 
-    def teammate(self, name):
-        for char in self.task.chars:
-            if char is not None and char.name == name:
-                return char
-        return None
-
-    def opener_pending(self):
-        return self.opener_blocked_by() is None
-
     def opener_blocked_by(self):
         """启动轴不跑的原因; 返回 None 表示该跑。
 
@@ -1268,22 +1260,7 @@ class Phrolova(NativePhrolova):
         return None
 
     # ==================== 宏原语 ====================
-    def macro_wait(self, sec):
-        """精确等待, 【不点击】。
-
-        不走 executor.sleep —— 它每 0.4 秒无条件插一次 next_frame 截图, 插入位置
-        不可控, 而这条轴的容错在 ±0.1 秒级。
-        """
-        if sec <= 0:
-            self.task.executor.check_enabled(check_pause=False)
-            return
-        end = time.time() + sec
-        while True:
-            left = end - time.time()
-            if left <= 0:
-                return
-            time.sleep(min(0.1, left))
-            self.task.executor.check_enabled(check_pause=False)
+    # 通用的在 src/combat/MacroKit.py (MacroKit); 这里只有这条轴自己的写法, 同名的盖过 MacroKit 的。
 
     def poll_wait(self, sec, tag=None):
         """等一段时间, 【不点击, 但一直刷新画面】。
@@ -1298,25 +1275,6 @@ class Phrolova(NativePhrolova):
             self.macro_wait(0.02)
         if tag:
             self.macro_mark(f'{tag}({time.time() - start:.2f}s)')
-
-    def macro_gap(self, sec, tag=None):
-        """间隙。【持续普攻打开时自动变成连点】—— 这就是"我没说停就一直A"。"""
-        if sec <= 0:
-            return 0
-        if not self.poking:
-            self.macro_wait(sec)
-            return 0
-        return self.macro_spam(sec, self.A_INTERVAL, tag=tag or 'gapA')
-
-    def macro_start(self):
-        self.macro_t0 = time.time()
-        self.macro_marks = []
-
-    def macro_mark(self, name):
-        self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
-
-    def macro_timeline(self, since=0):
-        return ' '.join(self.macro_marks[since:])
 
     def macro_spam(self, window, interval=None, tag='A', max_clicks=None):
         """连点一个窗口。
@@ -1407,100 +1365,6 @@ class Phrolova(NativePhrolova):
         self.macro_mark(f'{tag}_end(x{n},{time.time() - start:.2f}s)')
         return n
 
-    def segment_window(self, seg, n=1, lead=None):
-        """n 段普攻要给多长的连点窗口。
-
-        窗口 = (n-1) * 一段 + A_LEAD: 前 n-1 段各要等自己的动画走完, 最后一段只要
-        【递出去】就行 —— 它的动画会在切人之后继续演(合轴), 所以不给它留时长,
-        只留 A_LEAD 保证有一下落在能出招的第一帧。
-        """
-        return max(0.0, (n - 1) * seg) + (self.A_LEAD if lead is None else lead)
-
-    def spam_segments(self, seg, n=1, tag='A', lead=None, interval=None, max_clicks=None):
-        """打出 n 段普攻。【调用点写的是段数, 不是秒数】。"""
-        return self.macro_spam(self.segment_window(seg, n, lead),
-                               self.A_INTERVAL if interval is None else interval,
-                               tag=f'{tag}[{n}seg]', max_clicks=max_clicks)
-
-    def macro_key(self, key, settle=0.0, tag=None):
-        self.task.send_key(key)
-        self.macro_mark(tag or str(key))
-        self.macro_gap(settle)
-
-    def macro_hold_attack(self, hold, settle=0.0, tag='hold'):
-        """长按左键(重击)。
-
-        【长按期间绝对不要再 mouse_down() 补按】: PostMessage 后端每次 mouse_down
-        都会走 try_activate() 投一条 WM_ACTIVATE, 窗口收到就会把已经按住的状态打断。
-        一次 mouse_down 就一直有效, 包括跨过切人。
-        """
-        self.task.mouse_down()
-        self.holding_attack = True
-        self.macro_mark(f'{tag}_down')
-        try:
-            self.macro_wait(hold)
-        finally:
-            self.release_attack()
-        self.macro_mark(f'{tag}_up')
-        self.macro_gap(settle)
-
-    def release_attack(self):
-        if self.holding_attack:
-            self.task.mouse_up()
-            self.holding_attack = False
-
-    def spam_key(self, send, window, interval=None, tag='key', poke=None, presses=None,
-                 click_interval=None, stop_when=None):
-        """在一个窗口里反复发同一个技能键, 用来盖住动画那一段。
-
-        动画期间的按键是被丢掉的、不排队, 所以单发必丢, 症状统一是"那一步慢了"
-        (要等整个动画演完才有第二次机会)。
-
-        【必须在这个角色自己的回合里跑完, 不要跟切人并行】: 切人期间发出去的技能键会
-        被游戏带过换人边界落在新角色身上。点击可以并行, 技能键不行。
-
-        Args:
-            presses: 只发这么多次, 均匀铺在窗口里。用在"连续点按两次"那种【次数本身
-                有意义】的地方 —— 连发会把两发挤成一发。给了 presses 就由它说了算,
-                window 只用来推间隔。
-            stop_when: 每发一次之后调一次, 返回 True 就停。用在"多按一下会烧掉后面
-                要用的充能"的地方。【会读屏, 别配太密的 interval】。
-        """
-        interval = self.KEY_INTERVAL if interval is None else interval
-        poke = self.poking if poke is None else poke
-        click_interval = self.A_INTERVAL if click_interval is None else click_interval
-        if presses is not None and presses > 0:
-            interval = max(interval, window / presses)
-        start = time.time()
-        n = 0
-        clicks = 0
-        next_click = 0.0
-        while True:
-            send()
-            n += 1
-            if stop_when is not None and stop_when():
-                break
-            if presses is not None:
-                if n >= presses:
-                    break
-                left = interval
-            else:
-                left = window - (time.time() - start)
-                if left <= 0:
-                    break
-            step_end = time.time() + min(interval, left)
-            # 发键的节奏和点击的节奏各走各的: 挂在一起的话点击会被技能键的间隔卡住
-            while True:
-                now = time.time()
-                if now >= step_end:
-                    break
-                if poke and now >= next_click:
-                    self.click()
-                    clicks += 1
-                    next_click = now + click_interval
-                self.macro_wait(min(0.02, step_end - time.time()))
-        self.macro_mark(f'{tag}(x{n},A x{clicks})')
-        return n
     # ==================== 直切 ====================
 
     def quick_switch(self, target, click_during=None, settle=None, time_out=None,
@@ -1610,35 +1474,6 @@ class Phrolova(NativePhrolova):
             self.macro_mark(f'resync>{actual.name[:3]}')
             self.cur = actual
         return False
-
-    def handoff(self, from_char, to_char, con_full):
-        """复刻 switch_next_char() 尾部那套交接记账。
-
-        直接按数字键绕开了框架逻辑, 不补的话没人的 is_current_char 是 True,
-        get_current_char() 返回 None, AutoCombatTask 主循环当场崩。
-        """
-        self.task.in_liberation = False
-        from_char.switch_out(con_full=con_full)
-        to_char.is_current_char = True
-        to_char.has_intro = con_full
-        to_char.has_sub_dps_intro = con_full and from_char.is_sub_dps
-        to_char.last_switch_in_time = time.time()
-        if con_full:
-            now = time.time()
-            self.task.add_freeze_duration(now, to_char.intro_motion_freeze_duration, -100)
-            from_char.last_outro_time = now
-        self.cur = to_char
-
-    def switch_cd_left(self, char):
-        """某个角色的换人 CD 还剩多久 —— 【只算不等】。
-
-        【不读屏】: 头像上那个小数字是 OCR, 不便宜也不稳; 而 last_switch_time 是
-        我们自己在 handoff -> switch_out 里落的笔, 免费且精确。
-        """
-        last = getattr(char, 'last_switch_time', -1)
-        if last is None or last < 0:
-            return 0.0
-        return max(0.0, self.SWITCH_CD - (time.time() - last))
 
     def wait_switch_ready(self, char, tag='swCD', lead=0.0):
         """等某个角色的换人 CD 转好。
@@ -1774,87 +1609,6 @@ class Phrolova(NativePhrolova):
         self.logger.warning(f'{tag}: {char.name} liberation never started an animation '
                             f'after {n} presses (icon lit={lit})')
         return False
-
-    def poke_until_hud_back(self, tag='anim', time_out=None, tail=None):
-        """演出期间一直点普攻, 等队伍 HUD 回来(演出结束)再往下走。
-
-        【为什么点】: 演出结束的第一帧就要有输入落进去, 而演出期间的点击是被丢掉的、
-        不排队 —— 连点免疫被吞, 单发要么埋在演出里要么等太久。
-        【为什么还要 tail】: HUD 回来那一刻角色多半还在收招里, 那几下照样被吞。
-
-        【"HUD 回来"要先确认它消失过】: 进来的这一刻画面还在渐变, 读一帧很可能读回
-        True, 那就是"演出刚开头就判成结束"。所以要么先看到它真的消失过, 要么连着
-        HUD_NO_ANIM_GRACE 秒都读到在场(说明这一次压根没有演出)。
-        """
-        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
-        tail = self.LIB_ANIM_TAIL if tail is None else tail
-        start = time.time()
-        n = 0
-        gone_seen = False
-        back = False
-        next_click = 0.0
-        while time.time() - start < time_out:
-            now = time.time()
-            if now >= next_click:
-                self.click()
-                n += 1
-                next_click = now + self.A_INTERVAL
-            self.task.next_frame()
-            if not self.task.in_team()[0]:
-                gone_seen = True
-            elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
-                back = True
-                break
-            self.macro_wait(0.01)
-        # 演出这一段计入 freeze, 否则框架的 time_elapsed_accounting_for_freeze
-        # 会把它算成"这个角色磨蹭了 5 秒"
-        self.add_freeze_duration(start, time.time() - start)
-        self.macro_mark(f'{tag}({"ok" if back else "timeout"},'
-                        f'{"anim" if gone_seen else "NOANIM"},x{n},'
-                        f'{time.time() - start:.2f}s)')
-        if tail > 0:
-            self.macro_spam(tail, self.A_INTERVAL, tag=f'{tag}Tail')
-        return back
-
-    def spam_key_through_lib(self, send, tag='key', time_out=None, tail=None, poke=None):
-        """演出期间一直发某个技能键, 发到【演出真的结束】(HUD 回来)再补一小段。
-
-        【为什么不能按固定时长】: 大招哪一刻出手是浮动的 —— 早出手时演出早结束,
-        固定窗口的尾巴白发; 晚出手时演出还没完窗口就停了, 那些键一发都没进去
-        (症状是"R完不接E")。
-        """
-        time_out = self.LIB_ANIM_TIME_OUT if time_out is None else time_out
-        tail = self.LIB_ANIM_TAIL if tail is None else tail
-        poke = self.poking if poke is None else poke
-        start = time.time()
-        n = 0
-        gone_seen = False
-        back_at = None
-        next_click = 0.0
-        while time.time() - start < time_out:
-            send()
-            n += 1
-            now = time.time()
-            if poke and now >= next_click:
-                self.click()
-                next_click = now + self.A_INTERVAL
-            self.task.next_frame()
-            on_hud = self.task.in_team()[0]
-            if not on_hud:
-                gone_seen = True
-                back_at = None
-            elif back_at is None:
-                if gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
-                    back_at = time.time()
-            elif time.time() - back_at >= tail:
-                break
-            # 【必须 check_combat=False】: 演出期间读不到目标, 默认的 sleep 会跑
-            # 战斗判定并抛异常, 整个连发在第一轮就被打断、接着判脱战
-            self.sleep(self.KEY_INTERVAL, check_combat=False)
-        self.add_freeze_duration(start, time.time() - start)
-        self.macro_mark(f'{tag}(x{n},{"ok" if back_at else "timeout"},'
-                        f'{"anim" if gone_seen else "NOANIM"},{time.time() - start:.2f}s)')
-        return back_at is not None
 
     def wait_con_rise(self, char, cap, base=None, rise=None, min_wait=0.0,
                       tag='con涨'):
@@ -2005,21 +1759,6 @@ class Phrolova(NativePhrolova):
         self.macro_mark(f'{tag}({"满" if ready else "cap"},x{n},{time.time() - start:.2f}s)')
         return ready
 
-    def fire_echo(self, char, tag='Q'):
-        """把声骸键发出去 —— 【一次, 不读屏、不等】。
-
-        声骸是【脱手技能】: 键递出去角色马上就能做别的, 不需要留时间给它。
-        所以这里既不读屏也不连发 —— 那两样都是错的(前一条是纯延迟, 落在 CD 上
-        发键本来就是空操作; 后一条实打实占时间, 会把后面的时序整体推歪)。
-        它是零耗时的, 放在轴上任何位置都不用再算"塞进哪段死时间"。
-
-        【这条轴上三个人的 Q 都靠它】: 弗洛洛用它打断音符后摇、莫宁用它收尾、
-        坎特蕾拉用它取消强化A 的后摇。
-        """
-        char.send_echo_key()
-        char.record_echo_use()
-        self.macro_mark(tag)
-        return True
     def cd_baseline(self, box_name, probes=3):
         """读几次某个技能的剩余 CD, 取最大值当基线。
 
@@ -3070,15 +2809,6 @@ class Phrolova(NativePhrolova):
                 break
             self.macro_wait(interval)
         self.macro_mark(f'连拍{prefix}(x{n},{time.time() - t0:.2f}s)')
-
-    def dodge(self, tag='闪避'):
-        """闪避。这条轴上它【只用来取消后摇】, 不是为了躲伤害。
-
-        【发完立刻返回】(after_sleep=0): 后面紧跟着的连点要尽早开始 ——
-        闪避本身也有 0.27~0.35 秒吃输入, 晚一点开始连点就等于把 A 推到闪避演完之后。
-        """
-        self.task.send_key(self.task.key_config.get('Dodge Key'), after_sleep=0)
-        self.macro_mark(tag)
 
     def spam_ae(self, char, cap, stop, tag='AE连发', a_interval=None, e_interval=None,
                 f_interval=None, read_every=0.10, min_wait=0.0):

@@ -8,6 +8,7 @@ import numpy as np
 
 from src.char.BaseChar import SwitchPriority
 from src.char.Suoming import Suoming as NativeSuoming
+from src.combat.MacroKit import MacroKit, MacroBroken, send_input_left
 
 # ==================== 物理 F 键监视 ====================
 # 跟 Iuno__JingRan__ShoreKeeper/JingRan.py 里那份逐字相同, 说明见 Chisa__Suisui__YangYangSp/YangYangSp.py。
@@ -108,50 +109,7 @@ except ImportError:
 ENABLE_POLL_INTERVAL = 0.2
 
 
-# ==================== SendInput 左键(锁暝按住普攻用) ====================
-# 结构体照搬 Iuno__JingRan__ShoreKeeper/JingRan.py。
-_INPUT_MOUSE = 0
-_MOUSEEVENTF_LEFTDOWN = 0x0002
-_MOUSEEVENTF_LEFTUP = 0x0004
-
-
-class _KEYBDINPUT(ctypes.Structure):
-    _fields_ = [('wVk', ctypes.c_ushort), ('wScan', ctypes.c_ushort), ('dwFlags', ctypes.c_ulong),
-                ('time', ctypes.c_ulong), ('dwExtraInfo', ctypes.c_size_t)]
-
-
-class _MOUSEINPUT(ctypes.Structure):
-    _fields_ = [('dx', ctypes.c_long), ('dy', ctypes.c_long), ('mouseData', ctypes.c_ulong),
-                ('dwFlags', ctypes.c_ulong), ('time', ctypes.c_ulong), ('dwExtraInfo', ctypes.c_size_t)]
-
-
-class _HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [('uMsg', ctypes.c_ulong), ('wParamH', ctypes.c_ushort), ('wParamL', ctypes.c_ushort)]
-
-
-class _INPUTUNION(ctypes.Union):
-    _fields_ = [('ki', _KEYBDINPUT), ('mi', _MOUSEINPUT), ('hi', _HARDWAREINPUT)]
-
-
-class _INPUT(ctypes.Structure):
-    _fields_ = [('type', ctypes.c_ulong), ('u', _INPUTUNION)]
-
-
-def send_input_left(up):
-    """系统级左键按下/抬起。返回是否发出去了(发不出去调用方退回 PostMessage)。"""
-    try:
-        inp = _INPUT(type=_INPUT_MOUSE)
-        inp.u.mi = _MOUSEINPUT(0, 0, 0, _MOUSEEVENTF_LEFTUP if up else _MOUSEEVENTF_LEFTDOWN, 0, 0)
-        return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 1
-    except Exception:
-        return False
-
-
-class MacroBroken(Exception):
-    """某一步切人没成功 / HUD 长时间不在, 后面的按键会落在错的人身上 —— 整圈放弃, 交回框架。"""
-
-
-class Suoming(NativeSuoming):
+class Suoming(MacroKit, NativeSuoming):
     """锁暝。锁散维(锁暝/散华/维里奈)里她是主 C, 兼任【整条轴的持宏者】, 三个人的 do_perform 都转到 drive()。
 
     ================= 轴的出处 =================
@@ -477,15 +435,6 @@ class Suoming(NativeSuoming):
                 members += 1
         return members == 2
 
-    def teammate(self, name):
-        for char in self.task.chars:
-            if char is not None and char.name == name:
-                return char
-        return None
-
-    def opener_pending(self):
-        return self.opener_blocked_by() is None
-
     def opener_blocked_by(self):
         """启动轴不跑的原因; 返回 None 表示该跑。不查任何技能可用性(场下读数是旧的)。"""
         if not self.is_in_ssw:
@@ -510,26 +459,6 @@ class Suoming(NativeSuoming):
             return 'task.use_liberation is off'
         return None
 
-    def macro_wait(self, sec):
-        """精确等待, 【不点击】。切成 0.1 秒一片, 片间检查任务是否被停用。"""
-        if sec <= 0:
-            self.task.executor.check_enabled(check_pause=False)
-            return
-        end = time.time() + sec
-        while True:
-            left = end - time.time()
-            if left <= 0:
-                return
-            time.sleep(min(0.1, left))
-            self.task.executor.check_enabled(check_pause=False)
-
-    def wait_until_time(self, deadline):
-        self.macro_wait(deadline - time.time())
-
-    def macro_start(self):
-        self.macro_t0 = time.time()
-        self.macro_marks = []
-
     def macro_mark(self, name):
         self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
         # 【看门狗】每一步都会打标记, 在这里顺手查: HUD 很久没出现 = 关卡结束/过场/窗口没了,
@@ -537,16 +466,6 @@ class Suoming(NativeSuoming):
         if self.hud_watch and time.time() - self.hud_seen_at > self.HUD_LOST_ABORT:
             self.hud_watch = False
             raise MacroBroken(f'队伍 HUD {time.time() - self.hud_seen_at:.1f}s 没出现(关卡结束/过场/窗口没了?)')
-
-    def hud_ok(self):
-        """队伍 HUD 在不在(读当前帧)。见到就记下时刻, 给看门狗用。"""
-        ok = bool(self.task.in_team()[0])
-        if ok:
-            self.hud_seen_at = time.time()
-        return ok
-
-    def macro_timeline(self, since=0):
-        return ' '.join(self.macro_marks[since:])
 
     def macro_spam(self, window, interval=None, tag='A'):
         """连点一个窗口。打出几段由 window 决定(动画期间的点击被丢掉, 连点保证总有一下落在动画刚结束时)。"""
@@ -601,22 +520,6 @@ class Suoming(NativeSuoming):
         self.macro_mark(f'{tag}(x{n},A x{clicks})')
         return n
 
-    def game_foreground(self):
-        try:
-            return bool(self.task.executor.interaction.hwnd_window.is_foreground())
-        except Exception:
-            return False
-
-    def attack_down(self, direct):
-        """按下左键。direct = 走 SendInput(失败自动退回 PostMessage)。返回实际走没走 SendInput。"""
-        if direct and send_input_left(False):
-            self.si_holding = True
-        else:
-            direct = False
-            self.task.mouse_down()
-        self.holding_attack = True
-        return direct
-
     def release_attack(self):
         # 【SendInput 按下的必须 SendInput 松开】: PostMessage 的 mouse_up 只进游戏窗口的消息队列,
         # 系统里那个左键会一直按着 —— 宏异常退出时整台电脑的左键都是按住的
@@ -626,17 +529,6 @@ class Suoming(NativeSuoming):
             self.si_holding = False
             self.holding_attack = False
         elif self.holding_attack:
-            self.task.mouse_up()
-            self.holding_attack = False
-
-    def tap(self, hold=None):
-        """点一下普攻, 【真的按住 hold 秒】。"""
-        hold = self.A_TAP if hold is None else hold
-        self.task.mouse_down()
-        self.holding_attack = True
-        try:
-            self.macro_wait(hold)
-        finally:
             self.task.mouse_up()
             self.holding_attack = False
 
@@ -715,20 +607,6 @@ class Suoming(NativeSuoming):
         self.macro_mark(f'>{target.name[:3]}FAIL')
         return False
 
-    def handoff(self, from_char, to_char, con_full):
-        """复刻 switch_next_char() 尾部那套交接记账。不补的话 get_current_char() 返回 None, 主循环当场崩。"""
-        self.task.in_liberation = False
-        from_char.switch_out(con_full=con_full)
-        to_char.is_current_char = True
-        to_char.has_intro = con_full
-        to_char.has_sub_dps_intro = con_full and from_char.is_sub_dps
-        to_char.last_switch_in_time = time.time()
-        if con_full:
-            now = time.time()
-            self.task.add_freeze_duration(now, to_char.intro_motion_freeze_duration, -100)
-            from_char.last_outro_time = now
-        self.cur = to_char
-
     def switch_retry(self, target, tag, **kw):
         """quick_switch, 超时了先等 HUD 回来再切, 最多再试 SWITCH_RETRIES 次。只花时间。"""
         if self.quick_switch(target, **kw):
@@ -782,20 +660,6 @@ class Suoming(NativeSuoming):
         self.macro_wait(tail)
         return back
 
-    def wait_hud_up(self, cap=None, tag='HUD'):
-        """等队伍 HUD 【现在】在场。按 R 之前用 —— HUD 本来就不在的时候判"演出开始了"是假成功。"""
-        cap = self.HUD_UP_CAP if cap is None else cap
-        start = time.time()
-        while time.time() - start < cap:
-            self.task.next_frame()
-            if self.hud_ok():
-                if time.time() - start > 0.05:
-                    self.macro_mark(f'{tag}在场({time.time() - start:.2f}s)')
-                return True
-            self.macro_wait(0.02)
-        self.macro_mark(f'{tag}一直不在({cap:.1f}s)')
-        return False
-
     def on_field_char(self, time_out=None):
         """现在场上是谁 —— 只在拿不到入口角色时才用(开局 HUD 渐入时 in_team() 会说谎, 要 count 达标)。"""
         time_out = self.FIELD_SETTLE_TIME_OUT if time_out is None else time_out
@@ -817,15 +681,6 @@ class Suoming(NativeSuoming):
                                     f'expected={expected}), cannot tell who is on field')
                 return None
             self.macro_wait(0.03)
-
-    def mark_busy(self, busy):
-        """F 键监视线程靠它区分"战斗中手动处决"和"重开副本"。"""
-        self.task._ww_macro_busy = busy
-        self.task._three_fire_macro_busy = busy
-
-    def need(self, ok, what):
-        if not ok:
-            raise MacroBroken(what)
 
     def press_key_until_cd(self, send, available, cap, tag, ready_grace=0.15, poke=False):
         """一直按某个技能键到它进 CD。返回放出去了没有(本来就在 CD 上返回 False)。
@@ -866,101 +721,6 @@ class Suoming(NativeSuoming):
         self.macro_mark(f'{tag}_CD?(x{n},seen{int(seen_ready)},{cap:.1f}s)')
         self.logger.info(f'{tag}: never read as on-cooldown after {n} presses (seen ready={seen_ready})')
         return False
-
-    def press_res_until_cd(self, char, cap, tag, ready_grace=None, poke=False):
-        ready_grace = self.SKILL_BAR_SETTLE if ready_grace is None else ready_grace
-        return self.press_key_until_cd(char.send_resonance_key, char.resonance_available, cap, tag,
-                                       ready_grace=ready_grace, poke=poke)
-
-    def fire_r(self, char, tag, window):
-        """发大招到队伍 HUD【连续】消失 LIB_GONE_CONFIRM 帧。返回放出去没有。
-
-        发键之前先等 HUD 在场(HUD 本来就不在会假成功)。确认期间继续按 R 没有副作用 —— 演出里的按键被丢掉。
-        """
-        self.wait_hud_up(tag=f'{tag}前HUD')
-        start = time.time()
-        self.lib_press_at = start
-        n = gone = 0
-        fired = False
-        while time.time() - start < window:
-            char.send_liberation_key()
-            n += 1
-            self.task.next_frame()
-            if not self.hud_ok():
-                gone += 1
-                if gone >= self.LIB_GONE_CONFIRM:
-                    fired = True
-                    break
-            else:
-                gone = 0
-            self.macro_wait(self.LIB_KEY_INTERVAL)
-        self.task.skip_combat_check = True
-        if fired:
-            char.record_liberation_use()
-            self.macro_mark(f'{tag}_fired(x{n},{time.time() - start:.2f}s)')
-            return True
-        self.macro_mark(f'{tag}_NOFIRE(x{n})')
-        try:
-            lit = bool(char.liberation_available())
-        except Exception:
-            lit = 'err'
-        # lit=True: 键被上一个动作吞了; lit=False: 能量不够
-        self.logger.warning(f'{tag}: {char.name} liberation never started an animation '
-                            f'after {n} presses (icon lit={lit})')
-        return False
-
-    def lib_ready_reads(self, char, frames):
-        """HUD 在场时连续 frames 帧读到 char 的 R 可用。HUD 不在的帧不算, 最多读 frames*3 帧。"""
-        hits = 0
-        for _ in range(frames * 3):
-            self.task.next_frame()
-            if self.hud_ok():
-                try:
-                    ready = bool(char.liberation_available())
-                except Exception:
-                    ready = False
-                if not ready:
-                    return False
-                hits += 1
-                if hits >= frames:
-                    return True
-            self.macro_wait(0.02)
-        return False
-
-    def ensure_r(self, char, tag, window, cap, build):
-        """R 一定要放出来。读 R 亮 -> 按; 亮着却没放出去就再按, 最多 R_TRIES 次;
-        不亮 -> build(轮次) 攒一小段再读, 每 R_BLIND_EVERY 轮盲按一次防读数不准。上限 cap 只防打不到怪。
-        """
-        start = time.time()
-        tries = rounds = 0
-        while time.time() - start < cap:
-            if self.lib_ready_reads(char, 2):
-                tries += 1
-                if self.fire_r(char, f'{tag}R' if tries == 1 else f'{tag}R重按#{tries - 1}', window):
-                    if rounds:
-                        self.logger.info(f'{tag}: {char.name} R 攒了 {time.time() - start:.1f}s 能量才放出去')
-                    return True
-                if tries >= self.R_TRIES:
-                    break
-                continue
-            rounds += 1
-            if rounds == 1:
-                self.macro_mark(f'{tag}R没亮(攒能量)')
-            build(rounds)
-            if rounds % self.R_BLIND_EVERY == 0 and not self.lib_ready_reads(char, 2) and \
-                    self.fire_r(char, f'{tag}R盲按#{rounds}', self.R_BLIND_WINDOW):
-                return True
-        self.logger.warning(f'{tag}: {char.name} 的 R 保底 {time.time() - start:.1f}s 还是没放出去 '
-                            f'(亮了按 {tries} 次, 攒能量 {rounds} 轮), 不放了')
-        return False
-
-    def read_cd(self, name='resonance', char=None):
-        """读技能框里的 CD 数字(秒)。不在 CD / 读不到都返回 0(框架没 CD 时返回负数, 截成 0)。"""
-        try:
-            index = None if char is None else char.index
-            return max(0.0, float(self.task.get_cd(name, index)))
-        except Exception:
-            return 0.0
 
     def read_con(self, want, settle=None, click=False, tag=None):
         """读协奏: 自己刷帧、给结算留时间, 连着几帧达到 want 就立刻返回。返回期间读到的最大值。"""
@@ -1104,46 +864,6 @@ class Suoming(NativeSuoming):
         if tag:
             self.macro_mark(f'{tag}({why or f"没满con{best:.2f}"},{time.time() - start:.2f}s)')
         return why is not None
-
-    def break_prompt(self):
-        """怪身上有处决提示(屏幕中间那个 F, 排除拾取 F)。读当前帧。不看顶部的谐度满(f_break_full): 那个比提示早好几秒, 那时按 F 是空按。"""
-        task = self.task
-        try:
-            hit = task.find_one('f_break', box=task.box_of_screen(0.2, 0.2, 0.75, 0.8, hcenter=True, vcenter=True),
-                                target_height=720, threshold=self.BREAK_CENTER_MIN)
-            return bool(hit) and not task.is_pick_f()
-        except Exception as e:
-            self.logger.info(f'处决提示读失败 {e}')
-            return False
-
-    def break_ring(self):
-        """boss 头像外圈满了(共振度满, 能处决)。读当前帧。没有 boss 血条的怪永远 False。"""
-        try:
-            return bool(self.task.find_one('f_break_full', threshold=self.BREAK_RING_MIN))
-        except Exception:
-            return False
-
-    def break_press(self, tag):
-        """提示在就按 F, 按完 BREAK_RESEND 提示还在再按; 提示连 BREAK_GONE_FRAMES 帧不见 = 起手了。
-        返回(起手前最后一下 F 的时刻 或 None, 按了几下)。"""
-        presses = 0
-        last_f = 0.0
-        gone = 0
-        while True:
-            if gone == 0 and time.time() - last_f >= self.BREAK_RESEND:
-                if presses >= self.BREAK_PRESSES:
-                    return None, presses
-                self.task.send_key('f', down_time=0.05)
-                presses += 1
-                last_f = time.time()
-            self.macro_wait(0.03)
-            self.task.next_frame()
-            if self.hud_ok() and self.break_prompt():
-                gone = 0
-            else:
-                gone += 1
-                if gone >= self.BREAK_GONE_FRAMES:
-                    return last_f, presses
 
     def so_forte_full(self, so):
         """妄执满: E 位是无舍念(框架的 suoming_forte_e 模板)或锁妄念(自己的字形 SO_WN_GLYPH)。读当前帧。"""

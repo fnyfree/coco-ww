@@ -1,9 +1,10 @@
 import time
 
 from src.char.BaseChar import BaseChar, SwitchPriority
+from src.combat.MacroKit import MacroKit
 
 
-class Hiyuki(BaseChar):
+class Hiyuki(MacroKit, BaseChar):
     """绯雪主C: 放R变身 -> 爆发宏 -> 切人。
 
     爆发宏分两段:
@@ -344,31 +345,6 @@ class Hiyuki(BaseChar):
         self.lib2_count = 0
         self.logger.info(f'hiyuki macro: R2 released (held {press_time:.1f}s)')
         return True
-
-    def macro_wait(self, sec):
-        """精确等待。
-
-        不走 executor.sleep: 它每 sleep_check_interval(0.4s) 会无条件插一次
-        next_frame 截图(skip_combat_check 只跳过判定逻辑, 跳不过截图), 插入位置不可控。
-        空中居合/重击接R 的容错在 ±0.1 秒级, 排不了这种时序。
-        切成 0.1 秒一片并在片间检查任务是否被停用, 精度保持在 10 毫秒。
-        """
-        end = time.time() + sec
-        while True:
-            left = end - time.time()
-            if left <= 0:
-                return
-            time.sleep(min(0.1, left))
-            self.task.executor.check_enabled(check_pause=False)
-
-    def macro_start(self):
-        self.macro_t0 = time.time()
-        self.macro_marks = []
-
-    def macro_mark(self, name):
-        """记一笔输入发出的时刻。对着录像就能看出是哪一下被吞了:
-        某个输入的时刻比画面上那段动作的起点还早, 就是它把前一段取消掉了。"""
-        self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
 
     def macro_timeline(self):
         return ' '.join(self.macro_marks)
