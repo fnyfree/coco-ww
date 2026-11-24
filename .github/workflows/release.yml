@@ -1,6 +1,7 @@
 # 推到 main 的提交里 config.py 的版本号变了 -> 自动发 Release, 只带在线更新清单 update-manifest.json。
 # 不打整包: 在线更新按提交号从仓库下文件, 用不到 zip。整包(带 python 运行环境)只在新装/换运行环境时
 # 才要, 还是本地用 pack_release.py 打了手动传。版本号没变(或这个 tag 已经有了)就什么都不做。
+# 发之前先跑一遍测试 (test.yml), 不过就不发: 清单一发出去, 用户点「更新」就拿到了。
 name: Auto Release
 
 on:
@@ -19,7 +20,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
