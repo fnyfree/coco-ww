@@ -10,7 +10,7 @@ from src.task.process_feature import process_feature
 from src.task.task_icons import task_icon
 
 # coco-ww 自己的版本号; 程序底子是上游 ok-wuthering-waves v3.8.0 (ok-script 3.0.5b7), 之后的角色和功能适配自己做
-version = "v1.0.6"
+version = "v1.0.7"
 base_version = "v3.8.0"
 
 
