@@ -30,7 +30,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from src.net_ssl import open_url
 
 # 框架在 ok/__init__.py 里读这些名字; app_version 有值会覆盖 config 里的版本号, 所以保持 None。
 # 更新后重启时, 「更新成功 a -> b」和更新说明走 PYAPPIFY_APP_STARTING_VERSION /
@@ -120,7 +122,7 @@ def _open(url, accept=None):
     headers = {"User-Agent": USER_AGENT}
     if accept:
         headers["Accept"] = accept
-    return urlopen(Request(url, headers=headers), timeout=TIMEOUT)
+    return open_url(Request(url, headers=headers), timeout=TIMEOUT)
 
 
 def _get_json(url, accept=None):
