@@ -5,15 +5,40 @@ from typing import Any  # noqa
 import cv2  # noqa
 import numpy as np  # noqa
 
-from ok import Config, Logger  # noqa
+from ok import Config, FinishedException, Logger  # noqa
 from src import text_white_color  # noqa
 
 SKILL_TIME_OUT = 15
+# 精确等待每片多长: 片和片之间查一次停止/暂停, 片越短暂停响应越快
+PRECISE_WAIT_SLICE = 0.05
 
 
 class CharPerformTimeout(Exception):
     """原生角色单次上场超过硬上限时由战斗任务抛出, 只在 BaseChar.perform 里接住。"""
     pass
+
+
+class PreciseWaitPaused(BaseException):
+    """精确等待时发现暂停了 (点了暂停、游戏窗口最小化、前台模式下游戏不在前台), 或者这次上场中途暂停过。
+
+    抛出前已经松开了战斗任务记着的按键。BaseChar.perform 接住, 等到解除暂停再返回: 框架重新判战斗、
+    重新调 perform, 宏从头跑, 不接着暂停前的半截按 (停了一阵, 游戏里的状态早变了)。
+
+    继承 BaseException 而不是 Exception: 队伍代码里到处是 ``except Exception`` 兜底 (读屏失败之类),
+    包住了等待就会把它吞掉, 宏接着往下跑, 后面每次等待又马上抛, 等于一下不等地连按。
+    asyncio.CancelledError 当年也是为这个从 Exception 挪到 BaseException 的。
+    """
+    pass
+
+
+def precise_wait_blocked(executor):
+    """框架的 sleep 这时会原地等: 暂停了, 或者发不了键 (前台模式下游戏不在前台)。调试模式不管暂停, 和框架一样。"""
+    if getattr(executor, 'debug_mode', False):
+        return False
+    task = executor.current_task
+    interaction = executor.interaction
+    return bool(executor.blocked_by_pause() or (task is not None and task.paused)
+                or interaction is None or not interaction.should_capture())
 
 
 class CharType(StrEnum):
@@ -250,6 +275,10 @@ class BaseChar:
         watched = self.native_perform()
         if watched:
             self.task.perform_watch = (self, self.last_perform, self.perform_hard_timeout())
+        # 精确等待靠它知道有人接 PreciseWaitPaused, 以及这次上场中途暂停过没有。记在 task 上:
+        # 持宏的角色(心)在别人(莉莉)上场时替他跑宏, 精确等待是持宏角色调的
+        previous_perform = getattr(self.task, 'precise_perform', None)
+        self.task.precise_perform = (self, getattr(getattr(self.task, 'executor', None), 'pause_start', None))
         try:
             self.do_perform()
         except CharPerformTimeout as e:
@@ -258,11 +287,17 @@ class BaseChar:
             self.release_inputs()
             self.on_perform_timeout()
             self.switch_next_char()
+        except PreciseWaitPaused as e:
+            self.logger.info(f'{self} perform stopped by pause: {e}')
+            self.release_inputs()
+            # 暂停期间停在这里 (中途停任务也从这里抛出去); 能截图了再返回, 框架重新判战斗、重新调 perform
+            self.task.executor.next_frame()
         except BaseException:
             # 脱战/停任务/死亡: 别把蓄力中的左键、长按的 E 留在按下状态
             self.release_inputs()
             raise
         finally:
+            self.task.precise_perform = previous_perform
             watch = getattr(self.task, 'perform_watch', None)
             if watch and watch[0] is self:
                 self.task.perform_watch = None
@@ -350,12 +385,18 @@ class BaseChar:
         """硬超时后、切人前的清理, 子类可重置自己的状态机。"""
         pass
 
-    def release_inputs(self):
-        """松开战斗任务自己按住的键/鼠标, 防止超时/异常后角色一直蓄力或一直往前跑。"""
+    def release_inputs(self, wait_pause=True):
+        """松开战斗任务自己按住的键/鼠标, 防止超时/异常后角色一直蓄力或一直往前跑。
+
+        wait_pause=False: 暂停中也马上松 (默认走框架的松键函数, 暂停时要等解除暂停才发出去)。
+        """
         task = self.task
         try:
             if hasattr(task, 'release_held_inputs'):
-                task.release_held_inputs()
+                if wait_pause:
+                    task.release_held_inputs()
+                else:
+                    task.release_held_inputs(wait_pause=False)
             else:
                 task.mouse_up()
         except Exception as e:
@@ -506,6 +547,42 @@ class BaseChar:
             self.task.sleep(sec)
         finally:
             self.task.skip_combat_check = previous_skip_combat_check
+
+    def precise_wait(self, sec):
+        """精确等待 sec 秒, 中间不插框架的战斗判定。给自定义队伍代码的宏用, 代替各队自己写的 macro_wait。
+
+        框架的 sleep 每 0.4 秒插一次战斗判定 (BaseCombatTask.sleep_check)。目标没锁住时它会原地点中键找怪,
+        一般卡 3 秒, 看得到血条时最长 30 秒, 宏的节奏就全乱了。这里不走框架的 sleep, 每 PRECISE_WAIT_SLICE 秒查一次:
+        - 停止 (关任务/取消): 和框架一样马上抛 TaskDisabledException
+        - 暂停, 或这次上场中途暂停过: 松开按住的键, 抛 PreciseWaitPaused 结束这段宏, BaseChar.perform 接住。
+          不在 perform 里调 (没人接) 就不管暂停, 和原来各队的 macro_wait 一样
+        """
+        executor = self.task.executor
+        deadline = time.perf_counter() + max(0.0, sec)
+        while True:
+            if executor.exit_event.is_set():
+                raise FinishedException()
+            executor.check_enabled(check_pause=False)
+            self._stop_precise_wait_if_paused(executor)
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return
+            time.sleep(min(PRECISE_WAIT_SLICE, left))
+
+    def _stop_precise_wait_if_paused(self, executor):
+        performing = getattr(self.task, 'precise_perform', None)
+        if performing is None:
+            return
+        if precise_wait_blocked(executor):
+            reason = 'paused'
+        elif getattr(executor, 'pause_start', None) != performing[1]:
+            # 暂停那会儿宏正卡在某次按键里 (框架的按键函数发键前会等暂停), 解除后不能接着半截按
+            reason = 'paused during this perform'
+        else:
+            return
+        # 框架的 send_key_up 发键前也会等暂停, 走它的话要等到解除暂停才松开; 这里直接发
+        self.release_inputs(wait_pause=False)
+        raise PreciseWaitPaused(f'{reason}, inputs released, the macro starts over')
 
     def alert_skill_failed(self):
         # 读屏失灵时每次上场都会走到这, 弹窗限流
