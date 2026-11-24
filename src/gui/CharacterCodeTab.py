@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from PySide6.QtCore import QPointF, Qt, QSize, QUrl, Signal
 from PySide6.QtGui import (
@@ -39,6 +39,7 @@ from src.char.CustomCharLoader import (
     normalize_team, read_builtin_char_code, read_team_char_code, read_team_manifest,
     save_team_code_as_import, switch_all_teams_code_mode, switch_team_code_mode, team_code_state,
 )
+from src.net_ssl import open_url
 from src.char.TeamVariants import (
     activate_variant, add_variant_from_archive, delete_variant, forget_active,
     import_archive_as_active, list_variants,
@@ -548,8 +549,8 @@ def fetch_workshop_file(path, max_bytes):
         url = base + quoted
         logger.info(f"char code workshop request: {url}")
         try:
-            with urlopen(Request(url, headers={"User-Agent": WORKSHOP_USER_AGENT}),
-                         timeout=WORKSHOP_TIMEOUT) as response:
+            with open_url(Request(url, headers={"User-Agent": WORKSHOP_USER_AGENT}),
+                          timeout=WORKSHOP_TIMEOUT) as response:
                 content = response.read(max_bytes + 1)
         except HTTPError as error:
             # 只有 GitHub 自己说 404 才算仓库里没这个文件; 备用入口的 404 多半是它回源失败
