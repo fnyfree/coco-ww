@@ -11,7 +11,8 @@ import time
 import shutil
 import zipfile
 
-from .media import EXPORT_DIR, MediaIndex, finished_exports, folder_bytes, media_paths
+from .media import (EXPORT_DIR, LOW_WIDTH, MediaIndex, estimate_standard_bytes, finished_exports, folder_bytes,
+                    frames_width, media_paths, standard_media)
 from .recorder import RUN_FILE_RE
 from .runs import FEEDBACK_INFO, IMPORT_DIR, RunData, detail_lines, headline
 from .screenrec import VIDEO_EXTS, load_video_info, video_info_path
@@ -32,6 +33,10 @@ STORED_SUFFIXES = ('.media', '.png', '.jpg') + VIDEO_EXTS
 # 打开反馈包: 只留最近几个; 解出来超过这么大不解(防坏包把盘写满)
 IMPORT_KEEP = 10
 IMPORT_MAX_BYTES = 16 << 30
+# 整局画面怎么带: 原样 / 压回标清(960 宽, 别的 AI 认小字会吃力, 但包小一半多) / 不带
+FRAMES_KEEP = 'keep'
+FRAMES_STANDARD = 'standard'
+FRAMES_NONE = 'none'
 
 
 def _size(path):
@@ -70,7 +75,13 @@ class FeedbackPlan:
         self.name = os.path.basename(run_path)
         # 录屏对时结果(<stem>.video.json)跟着整局画面一起带上, 录屏本身太大不带
         self.media = [p for p in (*media_paths(run_path), video_info_path(run_path)) if os.path.isfile(p)]
-        self.frames = len(MediaIndex(run_path).frames) if self.media else 0
+        index = MediaIndex(run_path) if self.media else None
+        self.frames = len(index.frames) if index else 0
+        self.frame_width = frames_width(index) if index else 0
+        self.frame_height = max((int(e.get('h') or 0) for e in index.frames), default=0) if index else 0
+        # .media + .media.idx: 选「不带」时整块省掉, 「压回标清」时换成 standard_bytes
+        self.frames_bytes = sum(_size(p) for p in media_paths(run_path)) if self.frames else 0
+        self._standard_bytes = False
         self.exports = run_exports(out_dir, self.name)
         self.export_images = sum(_png_count(f) for f in self.exports)
         self.base_bytes = sum(_size(p) for p in [run_path] + self.media)
@@ -81,6 +92,37 @@ class FeedbackPlan:
         self.video = path if path and os.path.isfile(path) else None
         self.video_bytes = _size(self.video) if self.video else 0
         self.video_duration = video.get('duration')
+
+    @property
+    def can_standard(self):
+        """这局帧比标清宽, 才有「压回标清」可选。"""
+        return self.frame_width > LOW_WIDTH
+
+    def standard_bytes(self):
+        """压回标清后整局画面大约多大(挑几帧试压, 第一次调用要几十到一两百毫秒); 估不出来返回 None。"""
+        if self._standard_bytes is False:
+            try:
+                media = estimate_standard_bytes(self.run_path) if self.can_standard else None
+            except (OSError, ValueError):
+                media = None
+            index = media_paths(self.run_path)[1]
+            self._standard_bytes = None if media is None else media + _size(index)
+        return self._standard_bytes
+
+    def total_bytes(self, frames_mode=FRAMES_KEEP, with_exports=True, with_video=False):
+        """按对话框里选的, 包大约多大(没压缩前)。"""
+        total = self.base_bytes
+        if frames_mode == FRAMES_NONE:
+            total -= self.frames_bytes
+        elif frames_mode == FRAMES_STANDARD and self.can_standard:
+            standard = self.standard_bytes()
+            if standard is not None:
+                total += standard - self.frames_bytes
+        if with_exports:
+            total += self.export_bytes
+        if with_video and self.video:
+            total += self.video_bytes
+        return total
 
 
 def default_log_path():
@@ -165,8 +207,7 @@ def summary_text(info, run, lap_slot):
         '',
         '【包里有】',
         f"axis_runs/{info['run']}  这局的按键、读屏、在场、日志记录",
-        (f"axis_runs/{info['run'][:-6]}.media  整局画面 {info['frames']} 帧(960x540)" if info['frames']
-         else '整局画面: 这局没存(设置里关了「整局存画面」, 或者已经超出保留局数被删了)'),
+        frames_line(info),
     ]
     if exports:
         lines.append(f"axis_runs/{EXPORT_DIR}/  F8 导出 {len(exports)} 次 {sum(e['images'] for e in exports)} 张原图: "
@@ -187,6 +228,20 @@ def summary_text(info, run, lap_slot):
     return '\n'.join(lines) + '\n'
 
 
+def frames_line(info):
+    frames, mode = info['frames'], info.get('frames_mode') or FRAMES_KEEP
+    size = info.get('frames_size') or [0, 0]
+    stored = f'{size[0]}x{size[1]}' if size[0] else '960x540'
+    if not frames:
+        return '整局画面: 这局没存(设置里关了「整局存画面」, 或者已经超出保留局数被删了)'
+    if mode == FRAMES_NONE:
+        return f'整局画面: 这局存了 {frames} 帧({stored}), 打包时没带'
+    media = f"axis_runs/{info['run'][:-6]}.media  整局画面 {frames} 帧"
+    if mode == FRAMES_STANDARD:
+        return f'{media}(打包时压回了标清 960 宽; 本机是按 {stored} 存的)'
+    return f'{media}({stored})'
+
+
 def _add(zf, src, arcname, pause):
     entry = zipfile.ZipInfo.from_file(src, arcname)
     entry.compress_type = zipfile.ZIP_STORED if src.endswith(STORED_SUFFIXES) else zipfile.ZIP_DEFLATED
@@ -197,6 +252,16 @@ def _add(zf, src, arcname, pause):
                 break
             out.write(chunk)
             pause()
+
+
+def _add_standard(zf, run_path, pause):
+    """整局画面压回标清再进包: 先写 .media(zip 同时只能开一个写入), 索引最后写。"""
+    media_path, index_path = media_paths(run_path)
+    entry = zipfile.ZipInfo('axis_runs/' + os.path.basename(media_path), time.localtime(_mtime(media_path))[:6])
+    entry.compress_type = zipfile.ZIP_STORED
+    with zf.open(entry, 'w', force_zip64=True) as out:
+        index = standard_media(run_path, out, pause=pause)
+    zf.writestr('axis_runs/' + os.path.basename(index_path), index, compress_type=zipfile.ZIP_DEFLATED)
 
 
 def _export_info(folder):
@@ -235,8 +300,10 @@ def _mtime(path):
         return 0.0
 
 
-def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=None, busy=None, with_video=False):
-    """打成 <记录目录>/feedback/<这局>_反馈.zip, 返回路径。busy() 为真(轴开打了)时每写一块歇一下。"""
+def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=None, busy=None, with_video=False,
+                   frames_mode=FRAMES_KEEP):
+    """打成 <记录目录>/feedback/<这局>_反馈.zip, 返回路径。busy() 为真(轴开打了)时每写一块歇一下。
+    frames_mode: FRAMES_KEEP 整局画面原样带 / FRAMES_STANDARD 压回标清 / FRAMES_NONE 不带。"""
     run = RunData(plan.run_path)
     header = run.header
     wall0 = float(header.get('wall') or _mtime(plan.run_path) - run.duration)
@@ -245,13 +312,18 @@ def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=Non
     exports = plan.exports if with_exports else []
     if lap_slot is None:
         lap_slot = run.default_lap_slot()
+    if not plan.frames:
+        frames_mode = FRAMES_KEEP
+    elif frames_mode == FRAMES_STANDARD and not plan.can_standard:
+        frames_mode = FRAMES_KEEP  # 本来就是标清
     info = {
         'note': note or '', 'run': plan.name, 'start': _stamp(wall0)[:19], 'packed': _stamp(time.time())[:19],
         'duration': round(run.duration, 2), 'reason': run.reason,
         'team_dir': header.get('team_dir'), 'team_ver': header.get('team_ver'),
         'team': [run.char_name(i) for i in sorted(run.names)], 'size': header.get('size'),
         'plugin_recorded': header.get('plugin'), 'plugin_packed': _plugin_version(), 'coco_ww': _ok_version(),
-        'os': platform.platform(), 'frames': plan.frames,
+        'os': platform.platform(), 'frames': plan.frames, 'frames_mode': frames_mode,
+        'frames_size': [plan.frame_width, plan.frame_height],
         'exports': [_export_info(f) for f in exports], 'exports_skipped': len(plan.exports) - len(exports),
         'log': {'from': _stamp(wall0 - LOG_MARGIN), 'to': _stamp(wall1 + LOG_MARGIN), 'lines': len(log_lines)},
         'video': ({'name': os.path.basename(plan.video), 'bytes': plan.video_bytes}
@@ -271,8 +343,13 @@ def build_feedback(plan, note='', with_exports=True, lap_slot=None, log_path=Non
             zf.writestr(SUMMARY_NAME, summary_text(info, run, lap_slot))
             zf.writestr('feedback.json', json.dumps(info, ensure_ascii=False, indent=1))
             zf.writestr(LOG_NAME, ''.join(log_lines))
+            frame_files = media_paths(plan.run_path) if plan.frames else ()
             for src in [plan.run_path] + plan.media:
+                if src in frame_files and frames_mode != FRAMES_KEEP:
+                    continue
                 _add(zf, src, 'axis_runs/' + os.path.basename(src), pause)
+            if frames_mode == FRAMES_STANDARD:
+                _add_standard(zf, plan.run_path, pause)
             for export in exports:
                 for name in sorted(os.listdir(export)):
                     _add(zf, os.path.join(export, name), f'axis_runs/{EXPORT_DIR}/{os.path.basename(export)}/{name}',

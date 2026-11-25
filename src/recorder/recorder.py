@@ -19,7 +19,7 @@ from ok import Logger
 
 from .manual import ManualDriver
 from .screenrec import video_info_path
-from .media import (HOTKEYS, RING_IDLE_KEEP, FrameSink, HotkeyThread, MediaWriter, export_frames, prune_media,
+from .media import (DEFAULT_QUALITY, HOTKEYS, RING_IDLE_KEEP, FrameSink, HotkeyThread, MediaWriter, export_frames, prune_media,
                     ring_limit_note)
 
 logger = Logger.get_logger(__name__)
@@ -669,7 +669,7 @@ class Recorder:
                 seconds = 4.0
         if not (save or crops or seconds > 0):
             return None
-        return FrameSink(run, save, crops, seconds)
+        return FrameSink(run, save, crops, seconds, self._option('FRAMES_QUALITY_KEY', DEFAULT_QUALITY))
 
     # ---------- 热键导出 ----------
 

@@ -12,8 +12,9 @@ from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter,
 from PySide6.QtWidgets import QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QSizePolicy, QSplitter, \
     QStackedWidget, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget
 
-from .feedback import FEEDBACK_DIR, FeedbackPlan, build_feedback, import_feedback
-from .media import EXPORT_DIR, MediaIndex, clear_exports, export_usage
+from .feedback import (FEEDBACK_DIR, FRAMES_KEEP, FRAMES_NONE, FRAMES_STANDARD, FeedbackPlan, build_feedback,
+                       import_feedback)
+from .media import EXPORT_DIR, LOW_WIDTH, MediaIndex, clear_exports, export_usage
 from .recorder import HOLDER_ATTR, default_out_dir
 from .runs import (HUD_HIDDEN, RunData, Span, describe, detail_lines, headline, import_root, list_imported_runs,
                    list_runs, source_text, video_clock, video_pending)
@@ -541,6 +542,18 @@ BOX_WINDOW = 0.15
 FRAME_CACHE = 24
 # 两帧隔这么久就说明轴那段时间没取画面
 FRAME_GAP_NOTE = 0.6
+# 画面缩放: 按「全图」的倍数算, 滚一格乘/除这么多
+ZOOM_MAX = 8.0
+ZOOM_STEP = 1.25
+# 放大到这么多倍时, 标清存的局提醒一下会糊
+ZOOM_BLUR_NOTE = 2.0
+# 常看的几处(占画面的比例 x, y, 宽, 高), 按 16:9 鸣潮默认 HUD 估的
+ZOOM_PRESETS = [
+    ('技能栏', (0.70, 0.84, 0.30, 0.16)),
+    ('协奏', (0.34, 0.83, 0.32, 0.17)),
+    ('队伍', (0.86, 0.15, 0.14, 0.40)),
+    ('Boss', (0.30, 0.0, 0.40, 0.12)),
+]
 
 
 def _num_text(value):
@@ -550,7 +563,10 @@ def _num_text(value):
 
 
 class FrameView(QWidget):
-    """一帧低清画面, 上面叠这一刻读过的框。框是原分辨率坐标, 按画面宽度缩。"""
+    """一帧画面, 上面叠这一刻读过的框。框是原分辨率坐标, 按画面宽度缩。
+    能放大看: 滚轮以鼠标为中心缩放, 左键拖动平移, 双击回到全图; 放大时右上角有小地图, 点它跳过去。
+    换帧时缩放和位置不变(逐帧看同一块)。"""
+    zoomChanged = Signal(float)
 
     def __init__(self):
         super().__init__()
@@ -558,7 +574,13 @@ class FrameView(QWidget):
         self.source_w = None
         self.boxes = []
         self.message = ''
+        self.zoom = 1.0
+        # 视野中心落在画面的哪(0~1, 0~1)
+        self.center = (0.5, 0.5)
+        self._drag = None
+        self._minimap_drag = False
         self.setMinimumSize(240, 135)
+        self.setMouseTracking(True)
         # 高度跟着宽度走(16:9), 下面紧贴着放原图小块, 不留一大片空
         policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         policy.setHeightForWidth(True)
@@ -577,15 +599,154 @@ class FrameView(QWidget):
 
     def set_frame(self, image, source_w=None, boxes=(), message=''):
         self.image, self.source_w, self.boxes, self.message = image, source_w, list(boxes), message
+        self._update_cursor()
         self.update()
 
-    def image_rect(self):
+    # ---------- 缩放 ----------
+
+    def fit_rect(self):
+        """全图时画面占的地方(按比例塞进控件, 居中)。"""
         if self.image is None or self.image.isNull():
             return None
         iw, ih = self.image.width(), self.image.height()
         scale = min(self.width() / iw, self.height() / ih)
         w, h = iw * scale, ih * scale
         return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
+
+    def _clamped(self, center, w, h):
+        """视野不出画面: 放大后比控件还宽(高)的那一边, 中心离边至少半个控件; 没铺满的那一边居中。"""
+        out = []
+        for c, size, view in ((center[0], w, self.width()), (center[1], h, self.height())):
+            if size <= view:
+                out.append(0.5)
+            else:
+                half = view / (2 * size)
+                out.append(min(1 - half, max(half, c)))
+        return tuple(out)
+
+    def image_rect(self):
+        fit = self.fit_rect()
+        if fit is None or self.zoom <= 1.0:
+            return fit
+        w, h = fit.width() * self.zoom, fit.height() * self.zoom
+        cx, cy = self._clamped(self.center, w, h)
+        return QRectF(self.width() / 2 - cx * w, self.height() / 2 - cy * h, w, h)
+
+    def set_zoom(self, zoom, center=None, anchor=None):
+        """zoom 按全图的倍数(1 是全图)。center 给了就把那一点(0~1)放到中间;
+        anchor 给了(控件坐标)就让鼠标底下那一点缩放前后不动。"""
+        fit = self.fit_rect()
+        zoom = max(1.0, min(ZOOM_MAX, float(zoom)))
+        if fit is None:
+            self.zoom = zoom
+            self.center = center or self.center
+            self.zoomChanged.emit(self.zoom)
+            return
+        old = self.image_rect()
+        w, h = fit.width() * zoom, fit.height() * zoom
+        if center is None and anchor is not None and old is not None:
+            u = (anchor.x() - old.x()) / old.width()
+            v = (anchor.y() - old.y()) / old.height()
+            center = ((self.width() / 2 - anchor.x()) / w + u, (self.height() / 2 - anchor.y()) / h + v)
+        elif center is None:
+            center = self._clamped(self.center, old.width(), old.height()) if old is not None else self.center
+        self.zoom = zoom
+        self.center = (0.5, 0.5) if zoom <= 1.0 else self._clamped(center, w, h)
+        self._update_cursor()
+        self.update()
+        self.zoomChanged.emit(self.zoom)
+
+    def zoom_to(self, region):
+        """放大到画面里的一块 (x, y, 宽, 高), 都是 0~1 的比例; 刚好装下。"""
+        x, y, w, h = region
+        self.set_zoom(min(1.0 / max(w, 1e-3), 1.0 / max(h, 1e-3)), center=(x + w / 2, y + h / 2))
+
+    def reset_zoom(self):
+        self.set_zoom(1.0, center=(0.5, 0.5))
+
+    def minimap_rect(self):
+        fit = self.fit_rect()
+        if fit is None or self.zoom <= 1.0:
+            return None
+        w = min(200.0, max(96.0, self.width() * 0.22))
+        h = w * self.image.height() / self.image.width()
+        return QRectF(self.width() - w - 8, 8, w, h)
+
+    def _visible_part(self):
+        """视野框在画面里的比例 (x, y, 宽, 高)。"""
+        rect = self.image_rect()
+        x0 = max(0.0, -rect.x() / rect.width())
+        y0 = max(0.0, -rect.y() / rect.height())
+        x1 = min(1.0, (self.width() - rect.x()) / rect.width())
+        y1 = min(1.0, (self.height() - rect.y()) / rect.height())
+        return x0, y0, x1 - x0, y1 - y0
+
+    def _minimap_jump(self, pos):
+        mini = self.minimap_rect()
+        u = min(1.0, max(0.0, (pos.x() - mini.x()) / mini.width()))
+        v = min(1.0, max(0.0, (pos.y() - mini.y()) / mini.height()))
+        self.set_zoom(self.zoom, center=(u, v))
+
+    def _update_cursor(self):
+        if self._drag is not None:
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self.zoom > 1.0 and self.image is not None:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.unsetCursor()
+
+    def wheelEvent(self, event):
+        if self.fit_rect() is None:
+            return super().wheelEvent(event)
+        steps = event.angleDelta().y() / 120
+        if not steps:
+            return
+        self.set_zoom(self.zoom * ZOOM_STEP ** steps, anchor=event.position())
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton or self.fit_rect() is None:
+            return super().mousePressEvent(event)
+        mini = self.minimap_rect()
+        if mini is not None and mini.contains(event.position()):
+            self._minimap_drag = True
+            self._minimap_jump(event.position())
+        elif self.zoom > 1.0:
+            self._drag = (event.position(), self.center)
+            self._update_cursor()
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._minimap_drag:
+            self._minimap_jump(event.position())
+        elif self._drag is not None:
+            start, center = self._drag
+            rect = self.image_rect()
+            delta = event.position() - start
+            self.center = self._clamped((center[0] - delta.x() / rect.width(), center[1] - delta.y() / rect.height()),
+                                        rect.width(), rect.height())
+            self.update()
+        else:
+            mini = self.minimap_rect()
+            if mini is not None and mini.contains(event.position()):
+                self.setCursor(Qt.PointingHandCursor)
+            else:
+                self._update_cursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag = None
+            self._minimap_drag = False
+            self._update_cursor()
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self.fit_rect() is not None:
+            self.reset_zoom()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -597,8 +758,37 @@ class FrameView(QWidget):
             painter.drawText(self.rect().adjusted(12, 0, -12, 0), Qt.AlignCenter | Qt.TextWordWrap, self.message)
             return
         painter.drawImage(target, self.image)
-        if not self.source_w:
-            return
+        if self.source_w:
+            self._paint_boxes(painter, target)
+        if self.zoom > 1.0:
+            self._paint_minimap(painter)
+            if self.zoom >= ZOOM_BLUR_NOTE and self.image.width() <= LOW_WIDTH:
+                self._paint_note(painter, f'{self.image.width()}×{self.image.height()} 存的, 放大会糊 · 设置里可调清晰度')
+
+    def _paint_minimap(self, painter):
+        mini = self.minimap_rect()
+        painter.fillRect(mini.adjusted(-2, -2, 2, 2), QColor(0, 0, 0, 170))
+        painter.drawImage(mini, self.image)
+        x, y, w, h = self._visible_part()
+        view = QRectF(mini.x() + x * mini.width(), mini.y() + y * mini.height(), w * mini.width(), h * mini.height())
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(theme.color('accent'), 2))
+        painter.drawRect(view)
+
+    def _paint_note(self, painter, text):
+        small = QFont(self.font())
+        small.setPointSizeF(max(7.0, small.pointSizeF() * 0.85))
+        painter.setFont(small)
+        metrics = QFontMetrics(small)
+        mini = self.minimap_rect()
+        room = (mini.x() if mini is not None else self.width()) - 20
+        text = metrics.elidedText(text, Qt.ElideRight, int(max(60, room - 12)))
+        back = QRectF(8, 8, metrics.horizontalAdvance(text) + 12, metrics.height() + 8)
+        painter.fillRect(back, QColor(0, 0, 0, 180))
+        painter.setPen(theme.color('warning'))
+        painter.drawText(back, Qt.AlignCenter, text)
+
+    def _paint_boxes(self, painter, target):
         k = target.width() / self.source_w
         small = QFont(self.font())
         small.setPointSizeF(max(7.0, small.pointSizeF() * 0.8))
@@ -613,7 +803,7 @@ class FrameView(QWidget):
                 text = metrics.elidedText(label, Qt.ElideRight, 160)
                 back = QRectF(rect.x(), rect.y() - metrics.height() - 1, metrics.horizontalAdvance(text) + 6,
                               metrics.height())
-                if back.y() < target.y():
+                if back.y() < max(0.0, target.y()):
                     back.moveTop(rect.bottom() + 1)
                 fill = QColor(color)
                 fill.setAlpha(200)
@@ -672,7 +862,24 @@ class FramePanel(QWidget):
             bar.addWidget(button)
         layout.addLayout(bar)
         self.view = FrameView()
+        # 缩放这一排: 全图 + 常看的几处, 右边是放大倍数和这局存的分辨率
+        zoom_bar = QHBoxLayout()
+        zoom_bar.setSpacing(4)
+        self.zoom_buttons = []
+        for text, region in [('全图', None)] + ZOOM_PRESETS:
+            button = PushButton(text, variant='subtle', size='small')
+            button.setToolTip('回到整张画面(双击画面也行)' if region is None else f'放大看{text}那一块')
+            button.clicked.connect(lambda _=False, r=region: self.view.reset_zoom() if r is None else self.view.zoom_to(r))
+            zoom_bar.addWidget(button)
+            self.zoom_buttons.append(button)
+        zoom_bar.addStretch(1)
+        self.zoom_label = BodyLabel('')
+        self.zoom_label.setToolTip('放大倍数 · 这局画面存的分辨率(「跑轴记录」设置里的「整局画面清晰度」)\n'
+                                   '滚轮缩放(以鼠标为中心), 拖动平移, 双击回到全图; 换帧时缩放和位置不变')
+        zoom_bar.addWidget(self.zoom_label)
+        layout.addLayout(zoom_bar)
         layout.addWidget(self.view)
+        self.view.zoomChanged.connect(lambda _: self._update_zoom_label())
         self.crop_view = CropView()
         layout.addWidget(self.crop_view)
         self.crop_text = BodyLabel()
@@ -686,6 +893,7 @@ class FramePanel(QWidget):
         self.run, self.media = run, media
         self._cache.clear()
         self.boxed = []
+        self.view.reset_zoom()
         if run is not None:
             self.boxed = [e for e in run.events if e.get('e') in ('read', 'mark')
                           and (isinstance(e.get('box'), list) or isinstance(e.get('rb'), list))]
@@ -705,8 +913,19 @@ class FramePanel(QWidget):
             else:
                 message = ('这局没存画面。「跑轴记录」设置里开着「整局存画面」打的局才有, 只留最近几局。')
             self.view.set_frame(None, message=message)
+            self._update_zoom_label()
             return
         self._show(self.media.frame_index(t), t)
+
+    def _update_zoom_label(self):
+        has = self.view.image is not None and not self.view.image.isNull()
+        for button in self.zoom_buttons:
+            button.setEnabled(has)
+        if not has:
+            self.zoom_label.setText('')
+            return
+        image = self.view.image
+        self.zoom_label.setText(f'{self.view.zoom * 100:.0f}% · {image.width()}×{image.height()}')
 
     def step(self, delta):
         if not self.has_frames():
@@ -739,6 +958,7 @@ class FramePanel(QWidget):
         image = self._image(entry)
         self.view.set_frame(image, source_w, self._boxes_at(t),
                             message='' if image is not None else '这一帧读不出来(文件不完整)')
+        self._update_zoom_label()
 
     def _image(self, entry):
         key = entry['o']
@@ -1377,27 +1597,54 @@ class AxisRecorderTab(QWidget):
         except Exception as e:
             self._toast('error', '打包失败', str(e))
             return
-        accepted, note, with_exports, with_video = self._ask_feedback(plan)
+        accepted, note, with_exports, with_video, frames_mode = self._ask_feedback(plan)
         if not accepted:
             return
         self._packing = True
         self._update_pack_button()
         threading.Thread(target=self._pack_worker,
-                         args=(plan, note, with_exports, self.lap_box.currentData(), with_video),
+                         args=(plan, note, with_exports, self.lap_box.currentData(), with_video, frames_mode),
                          name='axis_recorder_feedback', daemon=True).start()
 
     def _ask_feedback(self, plan):
-        """返回 (打不打, 哪里不对, 带不带导出原图, 带不带录屏)。"""
+        """返回 (打不打, 哪里不对, 带不带导出原图, 带不带录屏, 整局画面怎么带)。"""
+        from PySide6.QtWidgets import QButtonGroup, QRadioButton
         stamp = plan.name[:15]
         when = f'{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}'
         team = ' / '.join(self.run.char_name(i) for i in sorted(self.run.names))
-        frames = f' + 整局画面 {plan.frames} 帧' if plan.frames else ''
+        frames = ' + 整局画面' if plan.frames else ''
         intro = BodyLabel(f'把这一局打成一个 zip, 发给做轴的人看:\n{when} · {team} · {self.run.duration:.1f}s\n'
-                          f'记录{frames} + 版本 + 这局前后的 coco-ww 日志, 约 {plan.base_bytes / 1e6:.1f}MB')
+                          f'记录{frames} + 版本 + 这局前后的 coco-ww 日志')
         note = PlainTextEdit()
         note.setPlaceholderText('哪里不对? 比如「第 2 圈 1:05 锁暝没放 R, 站着不动」(可以不填)')
         note.setFixedHeight(110)
         widgets = [intro, note]
+        modes = QButtonGroup(intro)
+        if plan.frames:
+            size = f'{plan.frame_width}×{plan.frame_height}' if plan.frame_width else '960×540'
+            widgets.append(BodyLabel(f'整局画面 {plan.frames} 帧 · 这局按 {size} 存的'))
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(14)
+            choices = [(FRAMES_KEEP, f'原样 ≈{plan.frames_bytes / 1e6:.0f}MB')]
+            if plan.can_standard:
+                standard = plan.standard_bytes()
+                choices.append((FRAMES_STANDARD, '压回标清' + (f' ≈{standard / 1e6:.0f}MB' if standard else '')))
+            choices.append((FRAMES_NONE, '不带'))
+            for i, (mode, text) in enumerate(choices):
+                radio = QRadioButton(text)
+                radio.setProperty('frames_mode', mode)
+                radio.setChecked(i == 0)
+                modes.addButton(radio)
+                row.addWidget(radio)
+            row.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(row)
+            widgets.append(holder)
+            if plan.can_standard:
+                hint = BodyLabel('压回标清要多花几秒; 对方要看小字、要拿去给 AI 认就选原样')
+                hint.setWordWrap(True)
+                widgets.append(hint)
         check = None
         if plan.exports:
             check = CheckBox(f'带上这局 F8 导出的原图({len(plan.exports)} 次 · {plan.export_images} 张 · '
@@ -1410,6 +1657,23 @@ class AxisRecorderTab(QWidget):
             video_check = CheckBox(f'带上录屏 {os.path.basename(plan.video)}({plan.video_bytes / 1e6:.0f}MB{length})')
             video_check.setToolTip('录屏很大, 对方要看画面细节时再带; 不带的话对方也能看到每一刻对应的录屏时间')
             widgets.append(video_check)
+        total = BodyLabel()
+
+        def frames_mode():
+            checked = modes.checkedButton()
+            return checked.property('frames_mode') if checked is not None else FRAMES_KEEP
+
+        def update_total(*_):
+            size = plan.total_bytes(frames_mode(), check is not None and check.isChecked(),
+                                    video_check is not None and video_check.isChecked())
+            total.setText(f'合计约 {size / 1e6:.1f}MB')
+
+        modes.buttonToggled.connect(update_total)
+        for toggle in (check, video_check):
+            if toggle is not None:
+                toggle.toggled.connect(update_total)
+        update_total()
+        widgets.append(total)
         if MessageBoxBase is not None:
             box = MessageBoxBase(self.window())
             box.viewLayout.addWidget(SubtitleLabel('打包反馈'))
@@ -1428,16 +1692,19 @@ class AxisRecorderTab(QWidget):
             for widget in widgets:
                 layout.addWidget(widget)
             buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.button(QDialogButtonBox.Ok).setText('打包')
+            buttons.button(QDialogButtonBox.Cancel).setText('取消')
             buttons.accepted.connect(box.accept)
             buttons.rejected.connect(box.reject)
             layout.addWidget(buttons)
             accepted = box.exec() == QDialog.Accepted
         return (accepted, note.toPlainText(), check is not None and check.isChecked(),
-                video_check is not None and video_check.isChecked())
+                video_check is not None and video_check.isChecked(), frames_mode())
 
-    def _pack_worker(self, plan, note, with_exports, lap_slot, with_video=False):
+    def _pack_worker(self, plan, note, with_exports, lap_slot, with_video=False, frames_mode=FRAMES_KEEP):
         try:
-            result = build_feedback(plan, note, with_exports, lap_slot, busy=self._recording, with_video=with_video)
+            result = build_feedback(plan, note, with_exports, lap_slot, busy=self._recording, with_video=with_video,
+                                    frames_mode=frames_mode)
         except Exception as e:
             result = e
         try:

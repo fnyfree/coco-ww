@@ -3,7 +3,8 @@ from src.task.task_icons import task_icon
 
 from . import VERSION
 from .manual import TICK_SECONDS
-from .media import HOTKEYS, MAX_EXPORT_SECONDS, NO_HOTKEY, RING_GUARANTEE_SECONDS
+from .media import (DEFAULT_QUALITY, FRAME_QUALITIES, HOTKEYS, MAX_EXPORT_SECONDS, NO_HOTKEY,
+                    RING_GUARANTEE_SECONDS)
 from .recorder import HOLDER_ATTR, Recorder, default_out_dir
 from .screenrec import MODE_REPLAY, MODE_TOGGLE, REC_OFF, TOOLS
 
@@ -52,6 +53,7 @@ class AxisRecorderTask(TriggerTask):
     LOGS_KEY = '记录日志'
     ALL_TASKS_KEY = '也记录其它战斗任务'
     FRAMES_KEY = '整局存画面'
+    FRAMES_QUALITY_KEY = '整局画面清晰度'
     FRAMES_KEEP_KEY = '画面保留最近几局'
     CROPS_KEY = '存读屏那块原图'
     HOTKEY_KEY = '导出原图热键'
@@ -80,6 +82,7 @@ class AxisRecorderTask(TriggerTask):
             self.LOGS_KEY: True,
             self.ALL_TASKS_KEY: False,
             self.FRAMES_KEY: True,
+            self.FRAMES_QUALITY_KEY: DEFAULT_QUALITY,
             self.FRAMES_KEEP_KEY: 5,
             self.CROPS_KEY: True,
             self.HOTKEY_KEY: 'F8',
@@ -120,7 +123,10 @@ class AxisRecorderTask(TriggerTask):
             self.READS_KEY: '记录队伍代码每次读屏的结果(找图、颜色占比、冷却、协奏), 连续读到一样的合成一段',
             self.LOGS_KEY: '把这一局里打的日志一起记进时间线',
             self.ALL_TASKS_KEY: '默认只记自动战斗; 打开后刷声骸、讨伐这类任务的战斗也记',
-            self.FRAMES_KEY: '每秒 4 帧缩到 960×540 存下来, 复盘页里画面跟着时间线走; 每局几十 MB',
+            self.FRAMES_KEY: '每秒 4 帧存下来, 复盘页里画面跟着时间线走; 存多清楚看下一项',
+            self.FRAMES_QUALITY_KEY: ('越清楚复盘页放大看得越清, 拿去给别的 AI 也认得出小字; 代价是占硬盘、反馈包更大。'
+                                      '4 分钟一局大约: 标清 45MB / 高清 95MB / 超清 170MB / 原分辨率(2K) 270MB。'
+                                      '编码在后台线程, 对轴基本没影响; 改了从下一局起生效'),
             self.FRAMES_KEEP_KEY: '只给最近几局留画面(按键读屏记录还是按上面的局数留)',
             self.CROPS_KEY: '读屏结果变了的那一刻, 把读的那块原图(不缩)存下来, 复盘页点读屏事件能看到',
             self.HOTKEY_KEY: '战斗里按一下, 把最近几秒的原图(不缩)导出到 logs/axis_runs/export, '
@@ -134,6 +140,7 @@ class AxisRecorderTask(TriggerTask):
         self.config_type[self.REC_TOOL_KEY] = {'type': 'drop_down', 'options': [REC_OFF] + list(TOOLS)}
         self.config_type[self.REC_MODE_KEY] = {'type': 'drop_down', 'options': [MODE_REPLAY, MODE_TOGGLE]}
         self.config_type[self.HOTKEY_KEY] = {'type': 'drop_down', 'options': list(HOTKEYS) + [NO_HOTKEY]}
+        self.config_type[self.FRAMES_QUALITY_KEY] = {'type': 'drop_down', 'options': list(FRAME_QUALITIES)}
         self.icon = task_icon('diagnosis')
         self.trigger_interval = 1
         self.recorder = None

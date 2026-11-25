@@ -1,4 +1,4 @@
-"""画面: 整局低清帧、读屏那块原图、热键导出最近几秒原图。
+"""画面: 整局帧(清晰度按设置, 默认 1280 宽)、读屏那块原图、热键导出最近几秒原图。
 
 热路径(执行器线程)只拿帧的引用塞进队列: 截图方式每帧给的都是新数组(WGC/BitBlt), 不用拷。
 缩放、编码、写盘在后台线程; OpenCV 编码时放开 GIL, 不跟轴抢。
@@ -23,8 +23,20 @@ logger = Logger.get_logger(__name__)
 
 MEDIA_VERSION = 1
 FRAME_INTERVAL = 0.25
+# 标清: 以前只有这一档; 打包反馈「压回标清」也压成这样
 LOW_WIDTH = 960
 JPEG_QUALITY = 70
+# 整局画面清晰度(设置里的下拉项) -> (最宽多少像素, JPEG 质量); 宽是 None 就不缩, 存原分辨率。
+# 编码在写盘线程里、OpenCV 编码时放开 GIL, 1080p 一帧约 3ms, 对轴基本没影响, 代价主要是硬盘和反馈包体积
+QUALITY_STANDARD = '标清 960×540'
+QUALITY_HIGH = '高清 1280×720'
+FRAME_QUALITIES = {
+    QUALITY_STANDARD: (LOW_WIDTH, JPEG_QUALITY),
+    QUALITY_HIGH: (1280, 85),
+    '超清 1920×1080': (1920, 85),
+    '原分辨率': (None, 85),
+}
+DEFAULT_QUALITY = QUALITY_HIGH
 # 热键导出用的原图都留在内存里(BGRA 一帧 1080p 8.3MB / 2K 14.7MB / 4K 33.2MB)。
 # 这么多秒以内任何分辨率都留够(4K 约 530MB); 设得更长时, 多出来的部分不超过内存上限
 RING_GUARANTEE_SECONDS = 4.0
@@ -81,18 +93,24 @@ def ring_frames(want, nbytes):
     return max(1, min(want, max(guaranteed, RING_MEMORY_CAP // max(1, nbytes))))
 
 
+def frame_quality(name):
+    """设置里选的清晰度 -> (最宽多少, JPEG 质量); 认不出的名字按默认。"""
+    return FRAME_QUALITIES.get(name) or FRAME_QUALITIES[DEFAULT_QUALITY]
+
+
 def shrink(frame, width=LOW_WIDTH):
-    """缩到 width 宽的 BGR。先按整数倍 INTER_AREA(快), 剩下一点用线性: 2K 单核约 2.5ms。"""
+    """缩到不超过 width 宽的 BGR(width 是 None 不缩)。先按整数倍 INTER_AREA(快), 剩下一点用线性: 2K 单核约 2.5ms。"""
     src = _bgra_base(frame)
     if src is None:
         src = frame
     h, w = src.shape[:2]
-    factor = w // width
-    if factor >= 2:
-        src = cv2.resize(src, (w // factor, h // factor), interpolation=cv2.INTER_AREA)
-        h, w = src.shape[:2]
-    if w > width:
-        src = cv2.resize(src, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_LINEAR)
+    if width:
+        factor = w // width
+        if factor >= 2:
+            src = cv2.resize(src, (w // factor, h // factor), interpolation=cv2.INTER_AREA)
+            h, w = src.shape[:2]
+        if w > width:
+            src = cv2.resize(src, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_LINEAR)
     if src.ndim == 3 and src.shape[2] == 4:
         src = cv2.cvtColor(src, cv2.COLOR_BGRA2BGR)
     return src
@@ -133,9 +151,10 @@ def _jsonable(value):
 class FrameSink:
     """一局的画面。热路径往里塞帧引用; 文件名等写盘线程开了 JSONL(run.path)再定。"""
 
-    def __init__(self, run, save_frames, crops, export_seconds):
+    def __init__(self, run, save_frames, crops, export_seconds, quality=DEFAULT_QUALITY):
         self.run = run
         self.save_frames = save_frames
+        self.frame_width, self.jpeg_quality = frame_quality(quality)
         self.crops = crops
         self.export_seconds = max(0.0, min(float(export_seconds), MAX_EXPORT_SECONDS))
         self.due = 0.0
@@ -328,8 +347,8 @@ class MediaWriter:
             return
         rel = round(t - sink.run.t0, 4)
         if kind == 'f':
-            small = shrink(item[3])
-            ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            small = shrink(item[3], sink.frame_width)
+            ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, sink.jpeg_quality])
             if ok:
                 sink.frame_count += 1
                 self._append(sink, buf, {'f': 1, 't': rel, 'w': int(small.shape[1]), 'h': int(small.shape[0])})
@@ -601,3 +620,80 @@ class MediaIndex:
         if inside is not None:
             return inside, True
         return before, False
+
+
+# ---------- 打包反馈: 压回标清 ----------
+
+def _recompress(data, width, quality):
+    """一帧 JPEG 缩到 width 宽重新编码: (新数据, 宽, 高); 解不开返回 None。"""
+    image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    small = shrink(image, width)
+    ok, buf = cv2.imencode('.jpg', small, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
+    return buf.tobytes(), int(small.shape[1]), int(small.shape[0])
+
+
+def frames_width(media):
+    """这局帧存的多宽(按最宽的那帧); 没帧是 0。"""
+    return max((int(e.get('w') or 0) for e in media.frames), default=0)
+
+
+def standard_media(run_path, out, width=LOW_WIDTH, quality=JPEG_QUALITY, pause=None):
+    """把一局的整局画面压成标清写进 out(可写的二进制文件对象), 返回配套的 .media.idx 文本。
+    读屏小块和本来就不比 width 宽的帧原样拷; 索引行顺序、表头不变, 偏移按新文件重算。"""
+    media_path, index_path = media_paths(run_path)
+    size = os.path.getsize(media_path)
+    with open(index_path, encoding='utf-8') as f:
+        lines = f.readlines()
+    out_lines, offset = [], 0
+    with open(media_path, 'rb') as src:
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if 'o' not in entry:
+                out_lines.append(json.dumps(entry, ensure_ascii=False, separators=(',', ':')) + '\n')
+                continue
+            if entry['o'] + entry.get('n', 0) > size:
+                continue  # 没写完就断了
+            src.seek(entry['o'])
+            data = src.read(entry['n'])
+            if entry.get('f') and int(entry.get('w') or 0) > width:
+                small = _recompress(data, width, quality)
+                if small is not None:
+                    data, entry['w'], entry['h'] = small
+            entry['o'], entry['n'] = offset, len(data)
+            out.write(data)
+            offset += len(data)
+            out_lines.append(json.dumps(entry, ensure_ascii=False, separators=(',', ':'), default=str) + '\n')
+            if pause is not None:
+                pause()
+    return ''.join(out_lines)
+
+
+def estimate_standard_bytes(run_path, samples=6, width=LOW_WIDTH, quality=JPEG_QUALITY):
+    """压回标清后 .media 大约多大: 均匀挑几帧试压, 按比例估; 读屏小块原样算。估不出来返回 None。"""
+    media = MediaIndex(run_path)
+    frames = [e for e in media.frames if int(e.get('w') or 0) > width]
+    if not frames:
+        return None
+    frame_bytes = sum(e['n'] for e in frames)
+    rest = sum(e['n'] for e in media.frames if int(e.get('w') or 0) <= width)
+    rest += sum(e['n'] for entries in media.crops.values() for e in entries)
+    picked = [frames[round(i * (len(frames) - 1) / max(1, samples - 1))] for i in range(min(samples, len(frames)))]
+    old = new = 0
+    try:
+        for entry in picked:
+            small = _recompress(media.read(entry), width, quality)
+            if small is not None:
+                old += entry['n']
+                new += len(small[0])
+    except OSError:
+        return None
+    if not old:
+        return None
+    return round(frame_bytes * new / old) + rest
