@@ -45,6 +45,7 @@
 import os
 import random
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -84,6 +85,15 @@ def rec(what):
 
 
 class FakeExecutor:
+    # coco-ww 的 MacroKit.macro_wait 走 BaseChar.precise_wait, 它每片都看 exit_event(停任务)和暂停状态
+    exit_event = threading.Event()
+    current_task = None
+    debug_mode = True
+    pause_start = None
+
+    def blocked_by_pause(self):
+        return False
+
     trigger_tasks = []
     onetime_tasks = []
     interaction = None

@@ -29,11 +29,32 @@
 import os
 import random
 import sys
+import threading
 import time
 import types
 
-sys.path.insert(0, r'F:\ok-ww\data\apps\ok-ww\working')
-os.chdir(r'F:\ok-ww\data\apps\ok-ww\working')
+def _okww_working():
+    """框架 working 目录(有 src/char/CustomCharLoader.py 的那层): OKWW_WORKING > 本文件往上找 > 旧版 OKWW 的默认位置。
+    coco-ww 是平铺结构, 往上找到的就是安装目录本身; 以前写死旧版路径, 在 coco-ww 里跑测的是旧框架和旧版队伍代码。"""
+    import os
+    cands = [os.environ.get('OKWW_WORKING')]
+    d = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        cands.append(d)
+        up = os.path.dirname(d)
+        if up == d:
+            break
+        d = up
+    cands.append(r'F:\ok-ww\data\apps\ok-ww\working')
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, 'src', 'char', 'CustomCharLoader.py')):
+            return c
+    raise SystemExit('找不到框架的 working 目录(里面有 src/char/CustomCharLoader.py), 设环境变量 OKWW_WORKING 再跑')
+
+
+_WORKING = _okww_working()
+sys.path.insert(0, _WORKING)
+os.chdir(_WORKING)             # 框架按相对路径 configs/custom_teams 找队伍代码
 sys.stdout.reconfigure(encoding='utf-8')
 
 DRY_LOOPS = int(os.environ.get('DRY_LOOPS', '2'))
@@ -52,6 +73,15 @@ def rec(what):
 
 
 class FakeExecutor:
+    # coco-ww 的 MacroKit.macro_wait 走 BaseChar.precise_wait, 它每片都看 exit_event(停任务)和暂停状态
+    exit_event = threading.Event()
+    current_task = None
+    debug_mode = True
+    pause_start = None
+
+    def blocked_by_pause(self):
+        return False
+
     trigger_tasks = []
     onetime_tasks = []
     interaction = None

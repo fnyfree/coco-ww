@@ -5,10 +5,30 @@
 用法: python dryrun.py.tool <队伍目录>
 """
 import sys
+import threading
 import time
 import importlib.util
 
-sys.path.insert(0, r'F:\ok-ww\data\apps\ok-ww\working')
+def _okww_working():
+    """框架 working 目录(有 src/char/CustomCharLoader.py 的那层): OKWW_WORKING > 本文件往上找 > 旧版 OKWW 的默认位置。
+    coco-ww 是平铺结构, 往上找到的就是安装目录本身; 以前写死旧版路径, 在 coco-ww 里跑会加载到旧框架(没有 MacroKit)。"""
+    import os
+    cands = [os.environ.get('OKWW_WORKING')]
+    d = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        cands.append(d)
+        up = os.path.dirname(d)
+        if up == d:
+            break
+        d = up
+    cands.append(r'F:\ok-ww\data\apps\ok-ww\working')
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, 'src', 'char', 'CustomCharLoader.py')):
+            return c
+    raise SystemExit('找不到框架的 working 目录(里面有 src/char/CustomCharLoader.py), 设环境变量 OKWW_WORKING 再跑')
+
+
+sys.path.insert(0, _okww_working())
 sys.stdout.reconfigure(encoding='utf-8')
 from src.char.BaseChar import CharType
 
@@ -36,6 +56,15 @@ class FakeInteraction:
 
 
 class FakeExecutor:
+    # coco-ww 的 MacroKit.macro_wait 走 BaseChar.precise_wait, 它每片都看 exit_event(停任务)和暂停状态
+    exit_event = threading.Event()
+    current_task = None
+    debug_mode = True
+    pause_start = None
+
+    def blocked_by_pause(self):
+        return False
+
     trigger_tasks = []
     onetime_tasks = []
     interaction = FakeInteraction()
@@ -258,6 +287,14 @@ for c in (JX, CL, HY):
 CL.resonance_available = lambda: True
 JX.resonance_available = lambda: time.time() > TASK.jx_e3_cd
 HY.resonance_available = lambda: time.time() > TASK.hy_e_cd
+# 绯雪回路圆牌(kendo_state 直接读 task.frame 像素, 假 task 没有画面): 假读屏一律"读不到",
+# iai_until_drop 走 KENDO_BLIND 按时刻连点的兜底分支, 测的是调用链和墙钟, 不测居合判据本身
+CL.kendo_state = lambda: (0, 0)
+# perform_axis 一直打到 task.in_combat() 为假才停(每段归刃演完查一次)。假 task 原来没有这个方法, 异常被当成"还在打",
+# 永远停不下来。跑完启动轴 + DRY_LOOPS 段循环(默认 3 = loop1~loop3 一整圈)就当脱战。
+import os  # noqa: E402
+DRY_LOOPS = int(os.environ.get('DRY_LOOPS', '3'))
+TASK.in_combat = lambda: getattr(CL, 'round_no', 1) < 1 + DRY_LOOPS
 CL.is_current_char = True
 
 T0[0] = time.time()
