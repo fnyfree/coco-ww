@@ -23,8 +23,11 @@ def run_events():
             events.append({'e': 'in', 't': round(t + 0.5, 3), 'a': 'key', 'k': 'e'})
             t += length
     events.append({'e': 'field', 't': round(t, 3), 'team': 1, 'i': 0, 'cnt': 3})
-    # 按住左键 1.5 秒(算按住 A), 一句 WARN 连刷三次, 一个读屏段, 一个打点
+    # 按住左键 1.5 秒(算按住 A), 连按两下切 Suoming, 一下 Shift 闪避, 一句 WARN 连刷三次, 一个读屏段, 一个打点
     events += [
+        {'e': 'in', 't': 4.0, 'a': 'key', 'k': '2'},
+        {'e': 'in', 't': 4.1, 'a': 'key', 'k': '2'},
+        {'e': 'in', 't': 4.7, 'a': 'key', 'k': 'lshift'},
         {'e': 'in', 't': 2.0, 'a': 'md', 'k': 'left'},
         {'e': 'in', 't': 3.5, 'a': 'mu', 'k': 'left'},
         {'e': 'log', 't': 2.2, 'l': 30, 'm': 'found multiple rings 2'},
@@ -126,6 +129,23 @@ class TabTest(unittest.TestCase):
         self.assertAlmostEqual(frac, 1 / 1.5, places=3)
         self.assertEqual(tab.canvas.cursor_t, 3.0)
         self.assertEqual(tab.lap_strip.cursor_t, 3.0)
+
+    def test_overlay_shows_recent_ops(self):
+        tab = self.tab
+        tab._set_time(3.0, 'strip')
+        ops = tab.frame_panel.view.overlay['ops']
+        self.assertEqual([op[0] for op in ops], ['E', 'A'])  # 1.5 按 E, 2.0 按下左键
+        self.assertAlmostEqual(ops[-1][1], 1.0, places=3)
+        tab._set_time(4.05, 'strip')
+        label, age, slot = tab.frame_panel.view.overlay['ops'][-1]
+        self.assertEqual((label, slot), ('切Suoming', 1))  # 只数到此刻, 第二下还没按
+        self.assertAlmostEqual(age, 0.05, places=3)
+        tab._set_time(4.8, 'strip')
+        labels = [op[0] for op in tab.frame_panel.view.overlay['ops']]
+        self.assertEqual(labels[-3:], ['切Suoming×2', 'E', '闪避'])
+        tab._set_time(21.0, 'strip')  # 第 3 圈 Suoming 慢的那段, 2 秒内没按键: 行还在, 是空的
+        self.assertEqual(tab.frame_panel.view.overlay['ops'], [])
+        self.assertFalse(tab.grab().isNull())
 
     def test_now_panel_lists_reads_logs_and_next(self):
         tab = self.tab

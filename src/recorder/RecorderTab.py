@@ -634,6 +634,10 @@ NOW_LOG_WINDOW = 1.5
 NOW_LOGS = 6
 NOW_READS = 8
 NOW_NEXT = 5
+# 画面左上角「操作」那一行: 只看这么多秒内按的键, 最多这么多个, 最后一个按下不到 OP_FLASH 秒时亮着
+OPS_WINDOW = 2.0
+OPS_MAX = 6
+OP_FLASH = 0.3
 
 
 def _num_text(value):
@@ -654,7 +658,8 @@ class FrameView(QWidget):
         self.source_w = None
         self.boxes = []
         self.message = ''
-        # 左上角叠的信息: {'title', 'time', 'field': (名字, 颜色, 文字), 'hold': (名字, 进度 0~1, 文字)}
+        # 左上角叠的信息: {'title', 'time', 'field': (名字, 颜色, 文字), 'ops': [(键, 几秒前, 切给几号位或 None)],
+        #                  'hold': (名字, 进度 0~1, 文字)}
         self.overlay = None
         # 这帧之后轴好久没取画面时的提醒, 叠在信息框最下面
         self.frame_note = ''
@@ -859,7 +864,7 @@ class FrameView(QWidget):
         painter.drawRect(view)
 
     def _paint_overlay(self, painter):
-        """左上角一块半透明的「此刻」: 第几圈 + 时间 / 谁在场 + 这一段多久 / 按住什么、按了多久。"""
+        """左上角一块半透明的「此刻」: 第几圈 + 时间 / 谁在场 + 这一段多久 / 最近按了什么 / 按住什么、按了多久。"""
         o = self.overlay or {}
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
@@ -885,6 +890,17 @@ class FrameView(QWidget):
         if field:
             chip_w = fb.horizontalAdvance(field[0]) + 14
             rows.append(('field', fb.height() + 6, chip_w + 8 + fm.horizontalAdvance(field[2])))
+        ops, chips = o.get('ops'), []
+        if ops is not None:
+            # 一个键一块: 文字 + 左右留白, 切人的前面多一个号位颜色的点; 太宽从最早的扔
+            for text, age, slot in ops:
+                chips.append((text, age, slot, fb.horizontalAdvance(text) + 12 + (10 if slot is not None else 0)))
+            op_tail = f'{ops[-1][1]:.2f}s前' if ops else f'{OPS_WINDOW:g} 秒内没按键'
+            op_head = fm.horizontalAdvance('操作') + 8
+            while len(chips) > 1 and op_head + sum(c[3] + 4 for c in chips) + 2 + fs.horizontalAdvance(op_tail) > limit:
+                chips.pop(0)
+            rows.append(('ops', fm.height() + 4,
+                         op_head + sum(c[3] + 4 for c in chips) + 2 + fs.horizontalAdvance(op_tail)))
         hold = o.get('hold')
         if hold:
             rows.append(('hold', fm.height(), fm.horizontalAdvance(hold[0]) + 8 + bar_w + 8 + fm.horizontalAdvance(hold[2])))
@@ -929,6 +945,33 @@ class FrameView(QWidget):
                 rest = box.right() - pad - chip.right() - 8
                 painter.drawText(QRectF(chip.right() + 8, y, rest, h), Qt.AlignVCenter | Qt.AlignLeft,
                                  fm.elidedText(text, Qt.ElideRight, int(rest)))
+            elif kind == 'ops':
+                painter.setFont(base)
+                painter.setPen(dim)
+                painter.drawText(QRectF(x0, y, op_head, h), Qt.AlignVCenter | Qt.AlignLeft, '操作')
+                x = x0 + op_head
+                for i, (text, age, slot, chip_w) in enumerate(chips):
+                    # 越早按的越淡; 最后一个刚按下时整块亮起来, 播放时看得出「这一下按了」
+                    fade = 1.0 - 0.55 * min(1.0, age / OPS_WINDOW)
+                    fresh = i == len(chips) - 1 and age < OP_FLASH
+                    chip = QRectF(x, y, chip_w, h)
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor('#EDEDF2') if fresh else QColor(255, 255, 255, int(16 + 30 * fade)))
+                    painter.drawRoundedRect(chip, 5, 5)
+                    tx = x + 6
+                    if slot is not None:
+                        dot = QColor(SLOT_COLORS[slot % len(SLOT_COLORS)])
+                        painter.setBrush(dot)
+                        painter.drawEllipse(QRectF(tx, y + h / 2 - 3, 6, 6))
+                        tx += 10
+                    painter.setFont(bold)
+                    painter.setPen(QColor('#101014') if fresh else QColor(237, 237, 242, int(255 * fade)))
+                    painter.drawText(QRectF(tx, y, chip.right() - tx, h), Qt.AlignCenter, text)
+                    x += chip_w + 4
+                painter.setFont(small)
+                painter.setPen(dim)
+                painter.drawText(QRectF(x + 2, y, fs.horizontalAdvance(op_tail) + 4, h), Qt.AlignVCenter | Qt.AlignLeft,
+                                 op_tail)
             elif kind == 'hold':
                 name, frac, text = hold
                 painter.setFont(base)
@@ -2186,7 +2229,7 @@ class AxisRecorderTab(QWidget):
 
     def _overlay_at(self, t):
         """画面左上角那块: 第几圈 + 时间 / 谁在场、这一段到现在多久、这一段一共多久(分了圈再给同顺序几圈的中位数) /
-        按住什么键、按了多久。"""
+        最近 OPS_WINDOW 秒按了什么(E/Q/R/闪避/切人/普攻…, 连按合成 ×N) / 按住什么键、按了多久。"""
         run, info = self.run, self.lap_info
         lap = info.lap_at(t)
         title = ''
@@ -2203,6 +2246,13 @@ class AxisRecorderTab(QWidget):
             else:
                 text = f'本段 {t - span.t0:.2f}s / {span.t1 - span.t0:.2f}s'
             overlay['field'] = (span.label, color, text)
+        if run.inputs:
+            ops = []
+            for label, count, last, event in run.recent_inputs(t, OPS_WINDOW, OPS_MAX):
+                key = str(event.get('k') or '')
+                slot = int(key) - 1 if label.startswith('切') and key.isdigit() else None
+                ops.append((label + (f'×{count}' if count > 1 else ''), t - last, slot))
+            overlay['ops'] = ops
         for hold in run.holds:
             if hold.t0 > t:
                 break

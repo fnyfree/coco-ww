@@ -7,10 +7,14 @@ import statistics
 from .recorder import list_run_files
 from .screenrec import TOOL_NAMES, format_clock, load_video_info
 
-KEY_ROLES = {'Resonance Key': 'E', 'Liberation Key': 'R', 'Echo Key': 'Q', 'Tool Key': 'T'}
+KEY_ROLES = {'Resonance Key': 'E', 'Liberation Key': 'R', 'Echo Key': 'Q', 'Tool Key': 'T', 'Dodge Key': '闪避',
+             'Jump Key': '跳'}
 DEFAULT_KEYS = {'e': 'E', 'r': 'R', 'q': 'Q', 't': 'T'}
-SPECIAL_KEYS = {'space': '跳', 'f': 'F', 'shift': '闪', 'lshift': '闪', 'esc': 'Esc', 'tab': 'Tab'}
-MOUSE_LABELS = {'left': 'A', 'right': '右键', 'middle': '中键', 'wheel': '滚轮'}
+# 键盘 WASD 是走路, 带上方向箭头, 免得和普攻(左键)的「A」混在一起
+SPECIAL_KEYS = {'space': '跳', 'f': 'F', 'shift': '闪避', 'lshift': '闪避', 'esc': 'Esc', 'tab': 'Tab',
+                'w': '↑W', 'a': '←A', 's': '↓S', 'd': '→D'}
+# 游戏里右键也是闪避(轴里 click(key='right') 都是拿来闪避取消后摇)
+MOUSE_LABELS = {'left': 'A', 'right': '闪避', 'middle': '中键', 'wheel': '滚轮'}
 HUD_HIDDEN = -1
 # 打开的反馈包解压到 <记录目录>/imported/<包名>/, 里面一份 axis_runs/ 和对方的 feedback.json
 IMPORT_DIR = 'imported'
@@ -235,6 +239,7 @@ class RunData:
         self.feedback = load_feedback_info(path)
         self.perform = self._perform_spans()
         self.inputs, self.holds = self._inputs()
+        self._input_ts = None
         self.input_groups = self._group_inputs()
         self.reads = self._read_rows()
         self.logs = [e for e in self.events if e.get('e') == 'log']
@@ -360,8 +365,25 @@ class RunData:
                 marks.append(InputMark(t, label, event, self.owner_at(t), self.uncertain_at(t)))
         for start in open_ones.values():
             holds.append(Span(start['t'], self.duration, '按住' + self.input_label(start) + '(没松)', None, start))
+        marks.sort(key=lambda m: m.t)
         holds.sort(key=lambda s: s.t0)
         return marks, holds
+
+    def recent_inputs(self, t, window, limit):
+        """t 之前 window 秒内按了什么: [(标签, 次数, 最后一下的时刻, 事件)], 早的在前, 只留最后 limit 个。
+        同一个键隔得近的连按合成一个, 只数到 t 为止(播放时次数跟着涨)。"""
+        if self._input_ts is None:
+            self._input_ts = [mark.t for mark in self.inputs]
+        lo = bisect.bisect_left(self._input_ts, t - window)
+        hi = bisect.bisect_right(self._input_ts, t)
+        out = []
+        for mark in self.inputs[lo:hi]:
+            if out and out[-1][0] == mark.label and mark.t - out[-1][2] <= REPEAT_GAP:
+                label, count, _, event = out[-1]
+                out[-1] = (label, count + 1, mark.t, event)
+            else:
+                out.append((mark.label, 1, mark.t, mark.event))
+        return out[-limit:]
 
     def _group_inputs(self):
         """连按合成一组, 只给时间线画; 统计和表格还是一次一条。"""
