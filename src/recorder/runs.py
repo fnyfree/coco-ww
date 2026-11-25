@@ -259,6 +259,11 @@ class RunData:
         i = self._span_index(t)
         return None if i is None else self.field[i].value
 
+    def span_at(self, t):
+        """t 时刻那一段在场(Span); 第一次认 HUD 之前是 None。"""
+        i = self._span_index(t)
+        return None if i is None else self.field[i]
+
     def owner_at(self, t):
         """t 时刻的按键算谁的: 认准在场的人; HUD 不在或没认全时往前找最后一个认准的人。"""
         i = self._span_index(t)

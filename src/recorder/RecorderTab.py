@@ -1,23 +1,27 @@
-"""「跑轴复盘」页: 选一局, 上面是时间线, 下面是能过滤的事件表和分圈对比, 右边是那一刻的画面, 点一下互相跳。"""
+"""「跑轴复盘」页(C1 影院布局): 画面放大当主角, 左上角叠此刻信息, 能逐帧、按事件跳、慢放;
+右边「此刻」列这一刻的读屏、前后日志、接下来; 底下整局分圈条 + 在场/按键/提醒三条时间线。
+读屏泳道和事件表(带分圈对比)收着, 要查代码时再展开。"""
 import bisect
 import collections
+import html
 import json
 import os
 import subprocess
 import threading
+import time
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPointF, QRect, QRectF, QSortFilterProxyModel, Qt, \
-    QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPen
-from PySide6.QtWidgets import QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QSizePolicy, QSplitter, \
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPoint, QPointF, QRect, QRectF, QSize, \
+    QSortFilterProxyModel, Qt, QTimer, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QImage, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtWidgets import QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QMenu, QSizePolicy, QSplitter, \
     QStackedWidget, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget
 
 from .feedback import (FEEDBACK_DIR, FRAMES_KEEP, FRAMES_NONE, FRAMES_STANDARD, FeedbackPlan, build_feedback,
                        import_feedback)
 from .media import EXPORT_DIR, LOW_WIDTH, MediaIndex, clear_exports, export_usage
 from .recorder import HOLDER_ATTR, default_out_dir
-from .runs import (HUD_HIDDEN, RunData, Span, describe, detail_lines, headline, import_root, list_imported_runs,
-                   list_runs, source_text, video_clock, video_pending)
+from .runs import (HUD_HIDDEN, LOG_LEVELS, READ_KINDS, RunData, Span, describe, detail_lines, headline, import_root,
+                   list_imported_runs, list_runs, source_text, video_clock, video_pending)
 from .screenrec import load_video_info, video_info_path
 
 # coco-ww 用宿主自带的控件库(ok.ui.qt.kit): 按钮、下拉框、文字用它的类, 其余原生控件靠
@@ -27,6 +31,7 @@ from PySide6.QtWidgets import QCheckBox as CheckBox, QLineEdit as SearchLineEdit
     QTableWidget as TableWidget
 
 from ok.ui.qt.kit.buttons import Button as PushButton
+from ok.ui.qt.kit.cards import Card
 from ok.ui.qt.kit.dialogs import confirm
 from ok.ui.qt.kit.feedback import show_toast
 from ok.ui.qt.kit.inputs import ComboBox
@@ -42,6 +47,8 @@ def isDarkTheme():
 
 
 LABEL_W = 210
+# 平时(C1 影院布局)底下只画在场/按键/提醒三条, 泳道名窄一点; 点「全部泳道」才画读屏、日志这些
+COMPACT_LABEL_W = 62
 RULER_H = 24
 PREFS_FILE = '_tab_prefs.json'
 # 每 0.5 秒看一眼是不是刚收尾(刚收尾马上刷新), 平时 3 秒读一次盘
@@ -105,9 +112,13 @@ def _end(item):
 
 
 class TimelineCanvas(QWidget):
+    """时间线。平时只画在场、按键(键盘和鼠标一条)、提醒(WARN 以上的日志和打点)三条;
+    full=True(「全部泳道」)时画全: 出招、鼠标单独一条、每一处读屏、日志。"""
     timeClicked = Signal(float)
     timeDragged = Signal(float)
     eventClicked = Signal(object)
+    # 能看到的时间段变了(滚动、缩放、换局): (开始秒, 结束秒), 整局进度条上画框
+    viewChanged = Signal(float, float)
 
     def __init__(self, scroll_area):
         super().__init__()
@@ -117,12 +128,15 @@ class TimelineCanvas(QWidget):
         self.pps = 60.0
         self.cursor_t = None
         self.dark = False
+        self.full = False
+        self.label_w = COMPACT_LABEL_W
         self._label_rows = {}
         self._dragging = False
         self._drag_moved = False
         self.setMouseTracking(True)
         scroll_area.horizontalScrollBar().valueChanged.connect(self.update)
         scroll_area.verticalScrollBar().valueChanged.connect(self.update)
+        scroll_area.horizontalScrollBar().valueChanged.connect(lambda _: self._emit_view())
 
     # ---------- 数据 ----------
 
@@ -132,24 +146,50 @@ class TimelineCanvas(QWidget):
         self.lanes = self._build_lanes(run) if run is not None else []
         self._resize()
         self.update()
+        self._emit_view()
+
+    def set_full(self, full):
+        """切换「全部泳道」; 看的时间段和红线不变。"""
+        if full == self.full:
+            return
+        anchor = self.cursor_t
+        self.full = full
+        self.label_w = LABEL_W if full else COMPACT_LABEL_W
+        self.lanes = self._build_lanes(self.run) if self.run is not None else []
+        self._resize()
+        if anchor is not None:
+            self.center_on(anchor)
+        self.update()
+        self._emit_view()
+
+    def content_height(self):
+        return (self.lanes[-1].y + self.lanes[-1].h + 12) if self.lanes else 120
 
     def _build_lanes(self, run):
         keys = [m for m in run.input_groups if m.event.get('a') not in ('click', 'md', 'mu', 'wheel')]
         mouse = [m for m in run.input_groups if m.event.get('a') in ('click', 'md', 'mu', 'wheel')]
         key_holds = [h for h in run.holds if h.event.get('a') not in ('md', 'mu')]
         mouse_holds = [h for h in run.holds if h.event.get('a') in ('md', 'mu')]
-        lanes = [
-            Lane('field', '在场', 22, run.field),
-            Lane('perform', '出招(perform)', 16, run.perform),
-            Lane('keys', '按键', 28, key_holds + keys),
-            Lane('mouse', '鼠标', 22, mouse_holds + mouse),
-        ]
-        if run.marks:
-            lanes.append(Lane('marks', '打点', 18, run.marks))
-        for row in run.reads:
-            lanes.append(Lane('read', row.label, 14, row.events))
-        if run.logs:
-            lanes.append(Lane('logs', '日志', 18, run.logs))
+        if not self.full:
+            alerts = run.marks + [e for e in run.logs if (e.get('l') or 0) >= 30]
+            lanes = [
+                Lane('field', '在场', 22, run.field),
+                Lane('keys', '按键', 30, key_holds + mouse_holds + keys + mouse),
+                Lane('alerts', '提醒', 16, alerts),
+            ]
+        else:
+            lanes = [
+                Lane('field', '在场', 22, run.field),
+                Lane('perform', '出招(perform)', 16, run.perform),
+                Lane('keys', '按键', 28, key_holds + keys),
+                Lane('mouse', '鼠标', 22, mouse_holds + mouse),
+            ]
+            if run.marks:
+                lanes.append(Lane('marks', '打点', 18, run.marks))
+            for row in run.reads:
+                lanes.append(Lane('read', row.label, 14, row.events))
+            if run.logs:
+                lanes.append(Lane('logs', '日志', 18, run.logs))
         y = RULER_H + 4
         for lane in lanes:
             lane.y = y
@@ -160,30 +200,52 @@ class TimelineCanvas(QWidget):
 
     def _resize(self):
         duration = self.run.duration if self.run is not None else 0
-        height = (self.lanes[-1].y + self.lanes[-1].h + 12) if self.lanes else 200
-        self.resize(int(LABEL_W + max(1.0, duration) * self.pps + 60), int(height))
+        height = self.content_height() if self.lanes else 120
+        self.resize(int(self.label_w + max(1.0, duration) * self.pps + 60), int(height))
 
     def set_zoom(self, pps, anchor_t=None):
         bar = self.scroll_area.horizontalScrollBar()
         viewport = self.scroll_area.viewport().width()
         if anchor_t is None:
-            anchor_t = self.t_at(bar.value() + LABEL_W + (viewport - LABEL_W) / 2)
+            anchor_t = self.t_at(bar.value() + self.label_w + (viewport - self.label_w) / 2)
         offset = self.x_at(anchor_t) - bar.value()
         self.pps = max(5.0, min(2000.0, pps))
         self._resize()
         bar.setValue(int(self.x_at(anchor_t) - offset))
         self.update()
+        self._emit_view()
+
+    def visible_range(self):
+        bar = self.scroll_area.horizontalScrollBar()
+        viewport = self.scroll_area.viewport().width()
+        return max(0.0, self.t_at(bar.value() + self.label_w)), max(0.0, self.t_at(bar.value() + viewport))
+
+    def _emit_view(self):
+        self.viewChanged.emit(*self.visible_range())
+
+    def ensure_visible(self, t, margin=0.15):
+        """t 跑出能看到的那段(或者贴边了)就滚过去, 放着播时红线不会跑出去。"""
+        lo, hi = self.visible_range()
+        pad = (hi - lo) * margin
+        if not lo + pad <= t <= hi - pad:
+            bar = self.scroll_area.horizontalScrollBar()
+            viewport = self.scroll_area.viewport().width()
+            bar.setValue(int(self.x_at(t) - self.label_w - (viewport - self.label_w) * 0.3))
+
+    def set_cursor(self, t):
+        if t != self.cursor_t:
+            self._move_cursor(t)
 
     def x_at(self, t):
-        return LABEL_W + t * self.pps
+        return self.label_w + t * self.pps
 
     def t_at(self, x):
-        return (x - LABEL_W) / self.pps
+        return (x - self.label_w) / self.pps
 
     def center_on(self, t):
         bar = self.scroll_area.horizontalScrollBar()
         viewport = self.scroll_area.viewport().width()
-        bar.setValue(int(self.x_at(t) - LABEL_W - (viewport - LABEL_W) / 2))
+        bar.setValue(int(self.x_at(t) - self.label_w - (viewport - self.label_w) / 2))
         self.cursor_t = t
         self.update()
 
@@ -221,7 +283,7 @@ class TimelineCanvas(QWidget):
         for lane in self.lanes:
             if lane.y > rect.bottom() or lane.y + lane.h < rect.top():
                 continue
-            painter.fillRect(QRectF(max(rect.left(), LABEL_W), lane.y, rect.width(), lane.h), colors['lane'])
+            painter.fillRect(QRectF(max(rect.left(), self.label_w), lane.y, rect.width(), lane.h), colors['lane'])
             draw = getattr(self, '_draw_' + lane.kind)
             for item in self._visible(lane, t_lo, t_hi):
                 draw(painter, colors, metrics, lane, item)
@@ -233,7 +295,7 @@ class TimelineCanvas(QWidget):
 
     def _visible(self, lane, t_lo, t_hi):
         starts = lane.starts
-        if lane.kind in ('keys', 'mouse'):
+        if lane.kind in ('keys', 'mouse', 'alerts'):
             # 按住的段可能很长, 和点按混在一起, 数量也不多, 直接全扫
             for item in lane.items:
                 if _start(item) <= t_hi and _end(item) >= t_lo:
@@ -374,6 +436,12 @@ class TimelineCanvas(QWidget):
         rect = self._span_rect(lane, t0, t1, min_w=3.0)
         painter.fillRect(rect, self._read_color(event))
 
+    def _draw_alerts(self, painter, colors, metrics, lane, event):
+        if event.get('e') == 'mark':
+            self._draw_marks(painter, colors, metrics, lane, event)
+        else:
+            self._draw_logs(painter, colors, metrics, lane, event)
+
     def _draw_logs(self, painter, colors, metrics, lane, event):
         x = self.x_at(event['t'])
         color = QColor(LEVEL_COLORS.get(event.get('l'), colors['dim'].name()))
@@ -385,11 +453,11 @@ class TimelineCanvas(QWidget):
         vbar = self.scroll_area.verticalScrollBar().value()
         viewport = self.scroll_area.viewport()
         # 左边的泳道名
-        painter.fillRect(QRectF(hbar, vbar, LABEL_W, viewport.height()), colors['header'])
+        painter.fillRect(QRectF(hbar, vbar, self.label_w, viewport.height()), colors['header'])
         for lane in self.lanes:
             if lane.y + lane.h < vbar + RULER_H or lane.y > vbar + viewport.height():
                 continue
-            rect = QRectF(hbar + 6, lane.y, LABEL_W - 10, lane.h)
+            rect = QRectF(hbar + 6, lane.y, self.label_w - 10, lane.h)
             painter.setPen(colors['text'] if lane.kind != 'read' else colors['dim'])
             painter.drawText(rect, Qt.AlignVCenter | Qt.AlignLeft,
                              metrics.elidedText(lane.label, Qt.ElideMiddle, int(rect.width())))
@@ -400,25 +468,26 @@ class TimelineCanvas(QWidget):
         painter.setPen(colors['dim'])
         while t <= t_hi:
             x = self.x_at(t)
-            if x >= hbar + LABEL_W:
+            if x >= hbar + self.label_w:
                 label = f'{t:.2f}'.rstrip('0').rstrip('.') + 's'
                 painter.drawLine(QPointF(x, vbar + RULER_H - 6), QPointF(x, vbar + RULER_H))
                 painter.drawText(QPointF(x + 3, vbar + RULER_H - 8), label)
             t += step
-        if self.cursor_t is not None and self.x_at(self.cursor_t) >= hbar + LABEL_W:
+        if self.cursor_t is not None and self.x_at(self.cursor_t) >= hbar + self.label_w:
             painter.setPen(QColor('#E04848'))
             painter.drawText(QPointF(self.x_at(self.cursor_t) + 3, vbar + 10), f'{self.cursor_t:.3f}s')
-        painter.fillRect(QRectF(hbar, vbar, LABEL_W, RULER_H), colors['header'])
-        painter.setPen(colors['dim'])
-        painter.drawText(QRectF(hbar + 6, vbar, LABEL_W - 10, RULER_H), Qt.AlignVCenter | Qt.AlignLeft,
-                         'Ctrl+滚轮缩放  点或拖红线定位')
+        painter.fillRect(QRectF(hbar, vbar, self.label_w, RULER_H), colors['header'])
+        if self.label_w >= 150:
+            painter.setPen(colors['dim'])
+            painter.drawText(QRectF(hbar + 6, vbar, self.label_w - 10, RULER_H), Qt.AlignVCenter | Qt.AlignLeft,
+                             'Ctrl+滚轮缩放  点或拖红线定位')
 
     # ---------- 鼠标 ----------
 
     def _hit(self, pos):
         x, y = pos.x(), pos.y()
         hbar = self.scroll_area.horizontalScrollBar().value()
-        if self.run is None or x < hbar + LABEL_W:
+        if self.run is None or x < hbar + self.label_w:
             return None, None
         t = self.t_at(x)
         tolerance = 5 / self.pps
@@ -479,13 +548,13 @@ class TimelineCanvas(QWidget):
     def _drag_t(self, x):
         """拖到可视区左右边上顺带滚动。"""
         bar = self.scroll_area.horizontalScrollBar()
-        left = bar.value() + LABEL_W
+        left = bar.value() + self.label_w
         right = bar.value() + self.scroll_area.viewport().width()
         if x > right - DRAG_EDGE:
             bar.setValue(int(bar.value() + min(DRAG_SCROLL, x - (right - DRAG_EDGE))))
         elif x < left + DRAG_EDGE:
             bar.setValue(int(bar.value() - min(DRAG_SCROLL, left + DRAG_EDGE - x)))
-        x = max(x, bar.value() + LABEL_W)
+        x = max(x, bar.value() + self.label_w)
         return max(0.0, min(self.run.duration, self.t_at(x)))
 
     def mouseMoveEvent(self, event):
@@ -506,7 +575,7 @@ class TimelineCanvas(QWidget):
     def mousePressEvent(self, event):
         x = event.position().x()
         if event.button() != Qt.LeftButton or self.run is None \
-                or x < self.scroll_area.horizontalScrollBar().value() + LABEL_W:
+                or x < self.scroll_area.horizontalScrollBar().value() + self.label_w:
             return
         # 点哪儿红线到哪儿, 按住不放就能拖
         self._dragging, self._drag_moved = True, False
@@ -554,6 +623,17 @@ ZOOM_PRESETS = [
     ('队伍', (0.86, 0.15, 0.14, 0.40)),
     ('Boss', (0.30, 0.0, 0.40, 0.12)),
 ]
+# 画面底色(影院: 黑边)
+STAGE_BG = '#0E0E12'
+# 播放: 每这么多毫秒走一步; 速度可选(画面一秒 4 帧, 慢放看得清)
+PLAY_MS = 40
+SPEEDS = (0.25, 0.5, 1.0, 2.0)
+DEFAULT_SPEED = 0.5
+# 「此刻」: 日志看前后几秒、最多几条; 读屏最多列几处; 接下来列几条
+NOW_LOG_WINDOW = 1.5
+NOW_LOGS = 6
+NOW_READS = 8
+NOW_NEXT = 5
 
 
 def _num_text(value):
@@ -563,7 +643,7 @@ def _num_text(value):
 
 
 class FrameView(QWidget):
-    """一帧画面, 上面叠这一刻读过的框。框是原分辨率坐标, 按画面宽度缩。
+    """一帧画面(C1 影院布局里的主角), 上面叠这一刻读过的框和左上角的「此刻」信息。框是原分辨率坐标, 按画面宽度缩。
     能放大看: 滚轮以鼠标为中心缩放, 左键拖动平移, 双击回到全图; 放大时右上角有小地图, 点它跳过去。
     换帧时缩放和位置不变(逐帧看同一块)。"""
     zoomChanged = Signal(float)
@@ -574,32 +654,33 @@ class FrameView(QWidget):
         self.source_w = None
         self.boxes = []
         self.message = ''
+        # 左上角叠的信息: {'title', 'time', 'field': (名字, 颜色, 文字), 'hold': (名字, 进度 0~1, 文字)}
+        self.overlay = None
+        # 这帧之后轴好久没取画面时的提醒, 叠在信息框最下面
+        self.frame_note = ''
+        self.show_boxes = True
+        self.show_overlay = True
         self.zoom = 1.0
         # 视野中心落在画面的哪(0~1, 0~1)
         self.center = (0.5, 0.5)
         self._drag = None
         self._minimap_drag = False
-        self.setMinimumSize(240, 135)
+        self.setMinimumSize(320, 180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMouseTracking(True)
-        # 高度跟着宽度走(16:9), 下面紧贴着放原图小块, 不留一大片空
-        policy = QSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        policy.setHeightForWidth(True)
-        self.setSizePolicy(policy)
-
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, width):
-        return int(width * 9 / 16)
 
     def sizeHint(self):
-        size = super().sizeHint()
-        size.setHeight(self.heightForWidth(max(size.width(), 480)))
-        return size
+        return QSize(800, 450)
 
     def set_frame(self, image, source_w=None, boxes=(), message=''):
         self.image, self.source_w, self.boxes, self.message = image, source_w, list(boxes), message
         self._update_cursor()
+        self.update()
+
+    def set_overlay(self, overlay, note=None):
+        self.overlay = overlay
+        if note is not None:
+            self.frame_note = note
         self.update()
 
     # ---------- 缩放 ----------
@@ -748,22 +829,24 @@ class FrameView(QWidget):
             return
         super().mouseDoubleClickEvent(event)
 
+    # ---------- 画 ----------
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
-        painter.fillRect(self.rect(), QColor('#1A1A1A' if isDarkTheme() else '#E9EBEE'))
+        painter.fillRect(self.rect(), QColor(STAGE_BG))
         target = self.image_rect()
         if target is None:
             painter.setPen(QColor('#8C8C8C'))
             painter.drawText(self.rect().adjusted(12, 0, -12, 0), Qt.AlignCenter | Qt.TextWordWrap, self.message)
-            return
-        painter.drawImage(target, self.image)
-        if self.source_w:
-            self._paint_boxes(painter, target)
-        if self.zoom > 1.0:
-            self._paint_minimap(painter)
-            if self.zoom >= ZOOM_BLUR_NOTE and self.image.width() <= LOW_WIDTH:
-                self._paint_note(painter, f'{self.image.width()}×{self.image.height()} 存的, 放大会糊 · 设置里可调清晰度')
+        else:
+            painter.drawImage(target, self.image)
+            if self.source_w and self.show_boxes:
+                self._paint_boxes(painter, target)
+            if self.zoom > 1.0:
+                self._paint_minimap(painter)
+        if self.show_overlay and (self.overlay or self.frame_note):
+            self._paint_overlay(painter)
 
     def _paint_minimap(self, painter):
         mini = self.minimap_rect()
@@ -775,18 +858,98 @@ class FrameView(QWidget):
         painter.setPen(QPen(theme.color('accent'), 2))
         painter.drawRect(view)
 
-    def _paint_note(self, painter, text):
-        small = QFont(self.font())
-        small.setPointSizeF(max(7.0, small.pointSizeF() * 0.85))
-        painter.setFont(small)
-        metrics = QFontMetrics(small)
-        mini = self.minimap_rect()
-        room = (mini.x() if mini is not None else self.width()) - 20
-        text = metrics.elidedText(text, Qt.ElideRight, int(max(60, room - 12)))
-        back = QRectF(8, 8, metrics.horizontalAdvance(text) + 12, metrics.height() + 8)
-        painter.fillRect(back, QColor(0, 0, 0, 180))
-        painter.setPen(theme.color('warning'))
-        painter.drawText(back, Qt.AlignCenter, text)
+    def _paint_overlay(self, painter):
+        """左上角一块半透明的「此刻」: 第几圈 + 时间 / 谁在场 + 这一段多久 / 按住什么、按了多久。"""
+        o = self.overlay or {}
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        base = QFont(self.font())
+        size = base.pointSizeF() if base.pointSizeF() > 0 else 9.0
+        bold = QFont(base)
+        bold.setBold(True)
+        mono = QFont('Consolas')
+        mono.setPointSizeF(size)
+        mono.setBold(True)
+        small = QFont(base)
+        small.setPointSizeF(max(7.0, size * 0.9))
+        fm, fb, fmono, fs = QFontMetrics(base), QFontMetrics(bold), QFontMetrics(mono), QFontMetrics(small)
+        text_color, dim = QColor('#EDEDF2'), QColor('#A6A6B3')
+        pad, gap, bar_w = 10, 6, 72
+        limit = max(160, int(self.width() * 0.6))
+        rows = []
+        title, clock = o.get('title') or '', o.get('time') or ''
+        if title or clock:
+            width = fb.horizontalAdvance(title) + (8 if title else 0) + fmono.horizontalAdvance(clock)
+            rows.append(('head', max(fb.height(), fmono.height()), width))
+        field = o.get('field')
+        if field:
+            chip_w = fb.horizontalAdvance(field[0]) + 14
+            rows.append(('field', fb.height() + 6, chip_w + 8 + fm.horizontalAdvance(field[2])))
+        hold = o.get('hold')
+        if hold:
+            rows.append(('hold', fm.height(), fm.horizontalAdvance(hold[0]) + 8 + bar_w + 8 + fm.horizontalAdvance(hold[2])))
+        note = fs.elidedText(self.frame_note, Qt.ElideRight, limit) if self.frame_note else ''
+        if note:
+            rows.append(('note', fs.height(), fs.horizontalAdvance(note)))
+        if not rows:
+            painter.restore()
+            return
+        width = min(limit, max(w for _, _, w in rows)) + 2 * pad
+        height = sum(h for _, h, _ in rows) + gap * (len(rows) - 1) + 2 * pad - 2
+        box = QRectF(10, 10, width, height)
+        painter.setPen(QPen(QColor(255, 255, 255, 22), 1))
+        painter.setBrush(QColor(12, 12, 16, 205))
+        painter.drawRoundedRect(box, 9, 9)
+        y = box.y() + pad - 1
+        x0 = box.x() + pad
+        for kind, h, _ in rows:
+            if kind == 'head':
+                x = x0
+                if title:
+                    painter.setFont(bold)
+                    painter.setPen(text_color)
+                    painter.drawText(QRectF(x, y, fb.horizontalAdvance(title) + 2, h), Qt.AlignVCenter | Qt.AlignLeft,
+                                     title)
+                    x += fb.horizontalAdvance(title) + 8
+                painter.setFont(mono)
+                painter.setPen(theme.color('accent'))
+                painter.drawText(QRectF(x, y, fmono.horizontalAdvance(clock) + 4, h), Qt.AlignVCenter | Qt.AlignLeft,
+                                 clock)
+            elif kind == 'field':
+                name, color, text = field
+                chip = QRectF(x0, y, fb.horizontalAdvance(name) + 14, h)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(color))
+                painter.drawRoundedRect(chip, 5, 5)
+                painter.setFont(bold)
+                painter.setPen(QColor('#101014'))
+                painter.drawText(chip, Qt.AlignCenter, name)
+                painter.setFont(base)
+                painter.setPen(text_color)
+                rest = box.right() - pad - chip.right() - 8
+                painter.drawText(QRectF(chip.right() + 8, y, rest, h), Qt.AlignVCenter | Qt.AlignLeft,
+                                 fm.elidedText(text, Qt.ElideRight, int(rest)))
+            elif kind == 'hold':
+                name, frac, text = hold
+                painter.setFont(base)
+                painter.setPen(dim)
+                label_w = fm.horizontalAdvance(name)
+                painter.drawText(QRectF(x0, y, label_w + 2, h), Qt.AlignVCenter | Qt.AlignLeft, name)
+                bar = QRectF(x0 + label_w + 8, y + h / 2 - 2, bar_w, 4)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(255, 255, 255, 36))
+                painter.drawRoundedRect(bar, 2, 2)
+                painter.setBrush(QColor('#C9C9D3'))
+                painter.drawRoundedRect(QRectF(bar.x(), bar.y(), bar.width() * max(0.0, min(1.0, frac)), 4), 2, 2)
+                painter.setPen(text_color)
+                painter.drawText(QRectF(bar.right() + 8, y, fm.horizontalAdvance(text) + 4, h),
+                                 Qt.AlignVCenter | Qt.AlignLeft, text)
+            else:
+                painter.setFont(small)
+                painter.setPen(theme.color('warning'))
+                painter.drawText(QRectF(x0, y, width - 2 * pad, h), Qt.AlignVCenter | Qt.AlignLeft, note)
+            y += h + gap
+        painter.restore()
 
     def _paint_boxes(self, painter, target):
         k = target.width() / self.source_w
@@ -838,8 +1001,10 @@ class CropView(QWidget):
 
 
 class FramePanel(QWidget):
-    """右边那一列: 光标那一刻的画面(带读屏框)、上一帧/下一帧、点读屏事件时那块原图。"""
+    """画面这一块: 上面一排缩放, 中间画面(左上角叠此刻信息, 读屏框), 下面播放条。"""
     stepped = Signal(float)
+    eventStep = Signal(int)
+    playToggled = Signal()
 
     def __init__(self):
         super().__init__()
@@ -848,20 +1013,11 @@ class FramePanel(QWidget):
         self.index = -1
         self.t = 0.0
         self.boxed = []
+        self.speed = DEFAULT_SPEED
         self._cache = collections.OrderedDict()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        bar = QHBoxLayout()
-        self.caption = BodyLabel('画面')
-        bar.addWidget(self.caption, 1)
-        self.prev_button = PushButton('◀')
-        self.next_button = PushButton('▶')
-        for button, step in ((self.prev_button, -1), (self.next_button, 1)):
-            button.setFixedWidth(44)
-            button.clicked.connect(lambda _=False, s=step: self.step(s))
-            bar.addWidget(button)
-        layout.addLayout(bar)
-        self.view = FrameView()
+        layout.setSpacing(6)
         # 缩放这一排: 全图 + 常看的几处, 右边是放大倍数和这局存的分辨率
         zoom_bar = QHBoxLayout()
         zoom_bar.setSpacing(4)
@@ -874,20 +1030,75 @@ class FramePanel(QWidget):
             self.zoom_buttons.append(button)
         zoom_bar.addStretch(1)
         self.zoom_label = BodyLabel('')
-        self.zoom_label.setToolTip('放大倍数 · 这局画面存的分辨率(「跑轴记录」设置里的「整局画面清晰度」)\n'
-                                   '滚轮缩放(以鼠标为中心), 拖动平移, 双击回到全图; 换帧时缩放和位置不变')
         zoom_bar.addWidget(self.zoom_label)
         layout.addLayout(zoom_bar)
-        layout.addWidget(self.view)
+        self.view = FrameView()
+        layout.addWidget(self.view, 1)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        self.prev_event = PushButton('◀ 事件', size='small')
+        self.prev_event.setToolTip('跳到上一个事件: 切人上场、按键、松开按住的键、打点')
+        self.prev_button = PushButton('', icon='chevron-left', size='small')
+        self.prev_button.setToolTip('上一帧 (←)')
+        self.play_button = PushButton('', icon='play', variant='primary', size='small')
+        self.play_button.setToolTip('从红线处往后播 / 暂停 (空格)')
+        self.next_button = PushButton('', icon='chevron-right', size='small')
+        self.next_button.setToolTip('下一帧 (→)')
+        self.next_event = PushButton('事件 ▶', size='small')
+        self.next_event.setToolTip('跳到下一个事件: 切人上场、按键、松开按住的键、打点')
+        self.prev_event.clicked.connect(lambda: self.eventStep.emit(-1))
+        self.next_event.clicked.connect(lambda: self.eventStep.emit(1))
+        self.prev_button.clicked.connect(lambda: self.step(-1))
+        self.next_button.clicked.connect(lambda: self.step(1))
+        self.play_button.clicked.connect(self.playToggled.emit)
+        for button in (self.prev_event, self.prev_button, self.play_button, self.next_button, self.next_event):
+            bar.addWidget(button)
+        bar.addSpacing(8)
+        self.speed_buttons = {}
+        for speed in SPEEDS:
+            button = PushButton(f'{speed:g}×', variant='subtle', size='small')
+            button.setToolTip('播放速度(画面每秒 4 帧, 慢放看得清)')
+            button.clicked.connect(lambda _=False, s=speed: self.set_speed(s))
+            bar.addWidget(button)
+            self.speed_buttons[speed] = button
+        bar.addSpacing(8)
+        self.boxes_check = CheckBox('读屏框')
+        self.boxes_check.setChecked(True)
+        self.boxes_check.setToolTip('画面上叠这一刻前后 0.15 秒读过的框')
+        self.boxes_check.toggled.connect(self._toggle_boxes)
+        self.info_check = CheckBox('此刻信息')
+        self.info_check.setChecked(True)
+        self.info_check.setToolTip('画面左上角叠第几圈、谁在场、这一段多久、按住什么')
+        self.info_check.toggled.connect(self._toggle_info)
+        bar.addWidget(self.boxes_check)
+        bar.addWidget(self.info_check)
+        bar.addStretch(1)
+        self.frame_label = BodyLabel('')
+        self.frame_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bar.addWidget(self.frame_label)
+        layout.addLayout(bar)
         self.view.zoomChanged.connect(lambda _: self._update_zoom_label())
-        self.crop_view = CropView()
-        layout.addWidget(self.crop_view)
-        self.crop_text = BodyLabel()
-        self.crop_text.setWordWrap(True)
-        self.crop_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.crop_text)
-        layout.addStretch(1)
-        self._clear_crop('')
+        self.set_speed(DEFAULT_SPEED)
+
+    def set_speed(self, speed):
+        self.speed = speed
+        for value, button in self.speed_buttons.items():
+            button.set_variant('tonal' if value == speed else 'subtle')
+
+    def set_playing(self, playing):
+        self.play_button.set_icon('pause' if playing else 'play')
+
+    def _toggle_boxes(self, on):
+        self.view.show_boxes = on
+        self.view.update()
+
+    def _toggle_info(self, on):
+        self.view.show_overlay = on
+        self.view.update()
+
+    def set_overlay(self, overlay):
+        self.view.set_overlay(overlay)
 
     def set_run(self, run, media):
         self.run, self.media = run, media
@@ -897,35 +1108,25 @@ class FramePanel(QWidget):
         if run is not None:
             self.boxed = [e for e in run.events if e.get('e') in ('read', 'mark')
                           and (isinstance(e.get('box'), list) or isinstance(e.get('rb'), list))]
-        self._clear_crop('点时间线上的读屏或打点、或者下面表格里的读屏行, 这里显示读的那块原图(不缩)。'
-                         if media is not None and media.crops else '')
         self.show_time(0.0)
 
     def has_frames(self):
         return self.media is not None and bool(self.media.frames)
 
     def show_time(self, t):
+        self.t = t
         if not self.has_frames():
             self.index = -1
-            self.caption.setText('画面')
+            self.frame_label.setText('')
             if self.run is None:
                 message = ''
             else:
                 message = ('这局没存画面。「跑轴记录」设置里开着「整局存画面」打的局才有, 只留最近几局。')
+            self.view.frame_note = ''
             self.view.set_frame(None, message=message)
             self._update_zoom_label()
             return
         self._show(self.media.frame_index(t), t)
-
-    def _update_zoom_label(self):
-        has = self.view.image is not None and not self.view.image.isNull()
-        for button in self.zoom_buttons:
-            button.setEnabled(has)
-        if not has:
-            self.zoom_label.setText('')
-            return
-        image = self.view.image
-        self.zoom_label.setText(f'{self.view.zoom * 100:.0f}% · {image.width()}×{image.height()}')
 
     def step(self, delta):
         if not self.has_frames():
@@ -937,22 +1138,41 @@ class FramePanel(QWidget):
         if self.has_frames() and self.index >= 0:
             self._show(self.index, self.t)
 
+    def _update_zoom_label(self):
+        has = self.view.image is not None and not self.view.image.isNull()
+        for button in self.zoom_buttons:
+            button.setEnabled(has)
+        if not has:
+            self.zoom_label.setText('')
+            return
+        image = self.view.image
+        text = f'{self.view.zoom * 100:.0f}% · {image.width()}×{image.height()}'
+        tip = ('放大倍数 · 这局画面存的分辨率(「跑轴记录」设置里的「整局画面清晰度」)\n'
+               '滚轮缩放(以鼠标为中心), 拖动平移, 双击回到全图; 换帧时缩放和位置不变')
+        blurry = self.view.zoom >= ZOOM_BLUR_NOTE and image.width() <= LOW_WIDTH
+        if blurry:
+            text += ' · 放大会糊'
+            tip = (f'这局按 {image.width()}×{image.height()} 存的, 放大后小字看不清。'
+                   '「跑轴记录」设置里把「整局画面清晰度」调高, 下一局起生效\n' + tip)
+        self.zoom_label.setText(text)
+        self.zoom_label.setToolTip(tip)
+        self.zoom_label.setStyleSheet(f"color: {theme.color('warning').name()};" if blurry else '')
+
     def _show(self, index, t):
         frames = self.media.frames
-        self.index, self.t = index, t
+        self.index = index
         entry = frames[index]
-        caption = f"画面 {entry['t']:.2f}s"
-        if t - entry['t'] > 0.02:
-            caption += f'(光标 {t:.2f}s)'
-        caption += f'   {index + 1}/{len(frames)}'
+        caption = f"帧 {index + 1}/{len(frames)} · {entry['t']:.2f}s"
         clock = video_clock(self.run, t) if self.run is not None else None
         if clock:
-            caption += f'   ·  {clock}'  # 剪视频时拿这个时间去录屏里找
+            caption += f' · {clock}'  # 剪视频时拿这个时间去录屏里找
+        self.frame_label.setText(caption)
         gap = (frames[index + 1]['t'] if index + 1 < len(frames) else t) - entry['t']
+        note = ''
         if gap > FRAME_GAP_NOTE and t - entry['t'] > FRAME_GAP_NOTE / 2:
             # 画面是轴自己取的帧: 定时连点、等演出这类不读屏的时候就没有, 别把旧帧当成那一刻
-            caption += f'\n这帧之后 {gap:.1f}s 轴没取画面(定时操作或等演出时不读屏)'
-        self.caption.setText(caption)
+            note = f"这是 {entry['t']:.2f}s 的帧, 之后 {gap:.1f}s 轴没取画面(定时操作或等演出时不读屏)"
+        self.view.frame_note = note
         size = self.run.header.get('size') if self.run is not None else None
         source_w = size[0] if isinstance(size, list) and size else None
         image = self._image(entry)
@@ -1000,16 +1220,407 @@ class FramePanel(QWidget):
                 boxes.append((found_box, BOX_COLORS['found'], label))
         return boxes[:40]
 
-    def _clear_crop(self, text):
+
+class LapInfo:
+    """按某个角色上场分圈的结果; 整局进度条、画面左上角「第几圈」「本段多久 / 中位」共用。"""
+
+    def __init__(self, run=None, slot=None):
+        self.slot = slot
+        self.columns, self.laps = run.lap_breakdown(slot) if run is not None and slot is not None else ([], [])
+        self.baselines = RunData.lap_baselines(self.columns, self.laps)[0] if self.laps else []
+        self.starts = [lap[0] for lap in self.laps]
+
+    def lap_at(self, t):
+        """第几圈(从 0 数); 第一圈之前是 -1, 最后一圈之后是 len(laps); 没分圈 None。"""
+        if not self.laps:
+            return None
+        i = bisect.bisect_right(self.starts, t) - 1
+        if i < 0:
+            return -1
+        start, total, _ = self.laps[i]
+        return i if t < start + total else len(self.laps)
+
+    def over(self, i):
+        """第 i 圈比同样上场顺序那几圈的中位数慢多少秒; 比不了 None。"""
+        base = self.baselines[i]
+        if base is None or base[-1] is None:
+            return None
+        return self.laps[i][1] - base[-1]
+
+    def segment_at(self, i, t):
+        """第 i 圈里 t 落在谁那一段: (开始, 时长, 同顺序几圈这一段的中位数或 None)。"""
+        if i is None or not 0 <= i < len(self.laps):
+            return None
+        for key, (t0, duration) in self.laps[i][2].items():
+            if t0 <= t < t0 + duration:
+                base = self.baselines[i]
+                median = base[self.columns.index(key)] if base is not None and key in self.columns else None
+                return t0, duration, median
+        return None
+
+
+class LapStrip(QWidget):
+    """整局一条: 按分圈的角色切成一圈一圈, 比同顺序中位数慢的圈标红; 没分圈时按谁在场上色。
+    框出底下时间线正看着的那段, 红线是光标; 点或拖跳过去。"""
+    timePicked = Signal(float)
+
+    def __init__(self):
+        super().__init__()
+        self.run = None
+        # (开始, 结束, 字, 慢不慢, 悬停提示, 号位或 None)
+        self.segments = []
+        self.view = None
+        self.cursor_t = None
+        self._dragging = False
+        self.setFixedHeight(24)
+        self.setMouseTracking(True)
+
+    def set_run(self, run, info):
+        self.run = run
+        segments = []
+        if run is not None and info.laps:
+            first = info.laps[0][0]
+            if first > 0.05:
+                segments.append((0.0, first, '开场', False, f'开场  0–{first:.2f}s', None))
+            for i, (start, total, _) in enumerate(info.laps):
+                over = info.over(i)
+                slow = over is not None and over >= LAP_SLOW
+                tip = f'第 {i + 1} 圈  {start:.2f}–{start + total:.2f}s  用时 {total:.2f}s'
+                if over is not None:
+                    tip += f'\n比同样上场顺序那几圈的中位数{"慢" if over >= 0 else "快"} {abs(over):.2f}s'
+                segments.append((start, start + total, f'{i + 1}' + (f' · +{over:.1f}s' if slow else ''), slow, tip,
+                                 None))
+            end = info.laps[-1][0] + info.laps[-1][1]
+            if run.duration - end > 0.05:
+                segments.append((end, run.duration, '', False, f'最后一圈之后  {end:.2f}–{run.duration:.2f}s', None))
+        elif run is not None:
+            for span in run.field:
+                segments.append((span.t0, span.t1, span.label, False,
+                                 f'{span.label}  {span.t0:.2f}–{span.t1:.2f}s', span.value))
+        self.segments = segments
+        self.setToolTip('' if run is None or info.laps else '没分圈(右上角「分圈按」选一个角色), 这里按谁在场上色')
+        self.update()
+
+    def set_view(self, t0, t1):
+        self.view = (t0, t1)
+        self.update()
+
+    def set_cursor(self, t):
+        self.cursor_t = t
+        self.update()
+
+    def _k(self):
+        duration = self.run.duration if self.run is not None else 0
+        return self.width() / duration if duration > 0 else 0
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        h = self.height()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(theme.color('control'))
+        painter.drawRoundedRect(QRectF(self.rect()), 5, 5)
+        k = self._k()
+        if not k:
+            return
+        small = QFont(self.font())
+        small.setPointSizeF(max(7.0, small.pointSizeF() * 0.85))
+        painter.setFont(small)
+        metrics = QFontMetrics(small)
+        dark = isDarkTheme()
+        for t0, t1, text, slow, _, slot in self.segments:
+            rect = QRectF(t0 * k, 0, max(1.0, (t1 - t0) * k - 1), h)
+            if slot is not None:
+                color = QColor(HIDDEN_COLOR if slot == HUD_HIDDEN else SLOT_COLORS[slot % len(SLOT_COLORS)])
+                color.setAlpha(150)
+                ink = theme.color('text')
+            elif slow:
+                color, ink = QColor(248, 113, 113, 70), QColor('#F8A5A5' if dark else '#C2410C')
+            elif text and text != '开场':
+                color, ink = theme.color('control_hover'), theme.color('text_secondary')
+            else:
+                color, ink = theme.color('surface_alt'), theme.color('text_tertiary')
+            painter.fillRect(rect, color)
+            if text and rect.width() >= 14:
+                painter.setPen(ink)
+                painter.drawText(rect, Qt.AlignCenter, metrics.elidedText(text, Qt.ElideRight, int(rect.width() - 4)))
+        if self.view is not None:
+            v0, v1 = self.view
+            box = QRectF(v0 * k, 1, max(4.0, (v1 - v0) * k), h - 2)
+            fill = theme.color('text')
+            fill.setAlpha(22)
+            painter.setBrush(fill)
+            painter.setPen(QPen(theme.color('text'), 1.5))
+            painter.drawRoundedRect(box, 4, 4)
+        if self.cursor_t is not None:
+            painter.setPen(QPen(QColor('#E04848'), 2))
+            x = self.cursor_t * k
+            painter.drawLine(QPointF(x, 0), QPointF(x, h))
+
+    def _pick(self, x):
+        k = self._k()
+        if k:
+            self.timePicked.emit(max(0.0, min(self.run.duration, x / k)))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._k():
+            self._dragging = True
+            self._pick(event.position().x())
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and event.buttons() & Qt.LeftButton:
+            self._pick(event.position().x())
+            return
+        k = self._k()
+        if not k:
+            return
+        t = event.position().x() / k
+        tip = next((s[4] for s in self.segments if s[0] <= t < s[1]), '')
+        if tip:
+            QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+
+
+def build_moments(run):
+    """能跳的「事件」和「接下来」里列的东西: [(秒, HTML)]。切人上场、HUD 不在、按键(连按算一下)、松开按住的键、打点。
+    日志不算: WARN 常常一秒刷好几条, 放进来按「下一个事件」就只在日志里打转(日志在「前后 1.5 秒日志」和提醒那条里看)。"""
+    dim = theme.color('text_tertiary').name()
+    moments = []
+    previous = None
+    for span in run.field:
+        if span.certain and span.value != previous:
+            color = SLOT_COLORS[span.value % len(SLOT_COLORS)]
+            moments.append((span.t0, f'<span style="color:{color}">●</span> {html.escape(span.label)} 上场'))
+            previous = span.value
+        elif span.value == HUD_HIDDEN and span.t1 - span.t0 >= 0.5:
+            moments.append((span.t0, f'<span style="color:{dim}">HUD 不在 {span.t1 - span.t0:.2f}s</span>'))
+    for mark in run.input_groups:
+        text = html.escape(mark.label) + (f' ×{mark.count}' if mark.count > 1 else '')
+        moments.append((mark.t, text))
+    for hold in run.holds:
+        label = hold.label.replace('按住', '', 1).replace('(没松)', '')
+        if hold.label.endswith('(没松)'):
+            continue
+        moments.append((hold.t1, f'松开 {html.escape(label)} <span style="color:{dim}">共按住 '
+                                 f'{hold.t1 - hold.t0:.2f}s</span>'))
+    for event in run.marks:
+        moments.append((event['t'], f"打点 {html.escape(str(event.get('name')))} = "
+                                    f"{html.escape(_num_text(event.get('v')))}"))
+    moments.sort(key=lambda m: m[0])
+    return moments
+
+
+def _short(text, limit):
+    text = ' '.join(str(text).split())
+    return text if len(text) <= limit else text[:limit - 1] + '…'
+
+
+class NowPanel(Card):
+    """右边「此刻」: 光标这一刻读了哪些屏、前后 1.5 秒的日志、接下来发生什么; 点读屏事件时下面显示读的那块原图。
+    底下两个开关: 事件表(在下面展开事件表和分圈对比)、全部泳道(时间线画全读屏和日志)。"""
+    drawerToggled = Signal(bool)
+    lanesToggled = Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.run = None
+        self.media = None
+        self.moments = []
+        self._moment_ts = []
+        self._read_starts = []
+        self._log_ts = []
+        self.drawer_on = False
+        self.lanes_on = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        head = QHBoxLayout()
+        head.setContentsMargins(14, 10, 14, 4)
+        head.setSpacing(8)
+        head.addWidget(BodyLabel('此刻', role='strong'))
+        self.time_label = BodyLabel('', role='secondary')
+        head.addWidget(self.time_label)
+        head.addStretch(1)
+        outer.addLayout(head)
+
+        scroll = ScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }')
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(14, 4, 14, 10)
+        layout.setSpacing(4)
+
+        def section(title):
+            label = BodyLabel(title, role='section')
+            layout.addSpacing(6)
+            layout.addWidget(label)
+            return label
+
+        def text_label():
+            label = BodyLabel('')
+            label.setTextFormat(Qt.RichText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+            layout.addWidget(label)
+            return label
+
+        section('读屏')
+        self.reads_label = text_label()
+        self.more_label = text_label()
+        self.more_label.setWordWrap(False)
+        self.more_label.linkActivated.connect(lambda _: self.set_lanes(True))
+        section(f'前后 {NOW_LOG_WINDOW:g} 秒日志')
+        self.logs_label = text_label()
+        section('接下来')
+        self.next_label = text_label()
+        self.crop_title = section('读屏原图')
+        self.crop_view = CropView()
+        layout.addWidget(self.crop_view)
+        self.crop_text = BodyLabel('', role='secondary')
+        self.crop_text.setWordWrap(True)
+        self.crop_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.crop_text)
+        layout.addStretch(1)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(14, 6, 14, 10)
+        self.events_button = PushButton('事件表', size='small')
+        self.events_button.setToolTip('在下面展开事件表(能过滤)和分圈对比')
+        self.events_button.clicked.connect(lambda: self.set_drawer(not self.drawer_on))
+        self.lanes_button = PushButton('全部泳道', size='small')
+        self.lanes_button.setToolTip('时间线画全: 出招、鼠标单独一条、每一处读屏、全部日志')
+        self.lanes_button.clicked.connect(lambda: self.set_lanes(not self.lanes_on))
+        for button in (self.events_button, self.lanes_button):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            buttons.addWidget(button)
+        outer.addLayout(buttons)
+        self._clear_crop()
+
+    def set_drawer(self, on):
+        self.drawer_on = on
+        self.events_button.set_variant('tonal' if on else 'secondary')
+        self.drawerToggled.emit(on)
+
+    def set_lanes(self, on):
+        self.lanes_on = on
+        self.lanes_button.set_variant('tonal' if on else 'secondary')
+        self.lanesToggled.emit(on)
+
+    def set_run(self, run, media, moments):
+        self.run, self.media = run, media
+        self.moments = moments
+        self._moment_ts = [m[0] for m in moments]
+        self._read_starts = [[e['t'] for e in row.events] for row in run.reads] if run is not None else []
+        self._log_ts = [e['t'] for e in run.logs] if run is not None else []
+        if media is not None and media.crops:
+            self._clear_crop('点时间线上的读屏或打点、或者事件表里的读屏行, 这里显示读的那块原图(不缩)。')
+        else:
+            self._clear_crop()
+        self.show_time(0.0)
+
+    def show_time(self, t):
+        if self.run is None:
+            self.time_label.setText('')
+            for label in (self.reads_label, self.more_label, self.logs_label, self.next_label):
+                label.setText('')
+            return
+        self.time_label.setText(f'{t:.2f}s')
+        self._show_reads(t)
+        self._show_logs(t)
+        self._show_next(t)
+
+    def _colors(self):
+        return (theme.color('text_tertiary').name(), theme.color('warning').name(), theme.color('success').name())
+
+    def _show_reads(self, t):
+        dim, warn, ok = self._colors()
+        if not self.run.reads:
+            self.reads_label.setText(f'<span style="color:{dim}">这局没记读屏(设置里「记录读屏」关了, 或者手打的局)</span>')
+            self.more_label.setText('')
+            return
+        active = []
+        for row, starts in zip(self.run.reads, self._read_starts):
+            i = bisect.bisect_right(starts, t + BOX_WINDOW) - 1
+            if i >= 0:
+                event = row.events[i]
+                if event.get('t2', event['t']) >= t - BOX_WINDOW:
+                    active.append(event)
+        rows = []
+        for event in active[:NOW_READS]:
+            kind = event.get('k')
+            name = f'<span style="color:{dim}">{html.escape(str(READ_KINDS.get(kind, kind)))} · </span>' \
+                   f"{html.escape(str(event.get('name')))}"
+            if kind in ('find', 'feat'):
+                value = (f'<span style="color:{ok}">认到</span>' if event.get('ok')
+                         else f'<span style="color:{warn}">没认到</span>')
+            else:
+                value = html.escape(_num_text(event.get('v')))
+            length = event.get('t2', event['t']) - event['t']
+            if length >= 0.3:
+                value += f' <span style="color:{dim}">· {length:.1f}s</span>'
+            rows.append(f'<tr><td>{name}</td><td align="right">{value}</td></tr>')
+        if rows:
+            self.reads_label.setText('<table width="100%" cellspacing="0" cellpadding="1">' + ''.join(rows) + '</table>')
+        else:
+            self.reads_label.setText(f'<span style="color:{dim}">这一刻没读屏</span>')
+        rest = len(self.run.reads) - min(len(active), NOW_READS)
+        hidden = len(active) - NOW_READS
+        text = f'还有 {hidden} 处也在读 · ' if hidden > 0 else (f'另 {rest} 处这一刻没读 · ' if rest else '')
+        link = theme.color('accent').name()
+        self.more_label.setText(f'<a href="lanes" style="color:{link}; text-decoration:none">{text}看全部泳道 ›</a>'
+                                if not self.lanes_on else '')
+
+    def _show_logs(self, t):
+        dim, warn, _ = self._colors()
+        lo = bisect.bisect_left(self._log_ts, t - NOW_LOG_WINDOW)
+        hi = bisect.bisect_right(self._log_ts, t + NOW_LOG_WINDOW)
+        # 同一句连着刷的合成一条 ×N
+        groups = []
+        for event in self.run.logs[lo:hi]:
+            key = (event.get('l'), event.get('m'))
+            if groups and groups[-1][1] == key:
+                groups[-1][2] += 1
+            else:
+                groups.append([event, key, 1])
+        if len(groups) > NOW_LOGS:
+            groups = sorted(sorted(groups, key=lambda g: abs(g[0]['t'] - t))[:NOW_LOGS], key=lambda g: g[0]['t'])
+        rows = []
+        for event, _, count in groups:
+            level = event.get('l') or 0
+            tag = f'<b style="color:{warn}">{LOG_LEVELS.get(level, level)}</b> ' if level >= 30 else ''
+            times = f' <span style="color:{dim}">×{count}</span>' if count > 1 else ''
+            rows.append(f'<tr><td style="color:{dim}">{event["t"]:.2f}&nbsp;</td>'
+                        f"<td>{tag}{html.escape(_short(event.get('m', ''), 70))}{times}</td></tr>")
+        self.logs_label.setText('<table cellspacing="0" cellpadding="1">' + ''.join(rows) + '</table>' if rows else
+                                f'<span style="color:{dim}">前后 {NOW_LOG_WINDOW:g} 秒没有日志</span>')
+
+    def _show_next(self, t):
+        dim = self._colors()[0]
+        i = bisect.bisect_right(self._moment_ts, t + 0.0005)
+        upcoming = self.moments[i:i + NOW_NEXT]
+        rows = [f'<tr><td style="color:{dim}">{mt:.2f}&nbsp;</td><td>{text}</td></tr>' for mt, text in upcoming]
+        self.next_label.setText('<table cellspacing="0" cellpadding="1">' + ''.join(rows) + '</table>' if rows else
+                                f'<span style="color:{dim}">后面没有了</span>')
+
+    def _clear_crop(self, text=''):
         self.crop_view.set_image(None)
         self.crop_view.setVisible(False)
         self.crop_text.setText(text)
         self.crop_text.setVisible(bool(text))
+        self.crop_title.setVisible(bool(text))
 
     def show_event(self, event):
         if not isinstance(event, dict) or event.get('e') not in ('read', 'mark') or self.media is None:
             return
         entry, exact = self.media.crop_for(event)
+        self.crop_title.setVisible(True)
         if entry is None:
             self._clear_crop(f"{event.get('name')}: 这一处没存原图(框太大、没给框、或者这局没开「存读屏那块原图」)。")
             return
@@ -1088,6 +1699,8 @@ class EventModel(QAbstractTableModel):
 
 
 class AxisRecorderTab(QWidget):
+    """C1 影院布局: 上面一排选局和操作; 中间左边画面放大当主角(左上角叠此刻信息, 下面播放条), 右边「此刻」;
+    底下「进度」: 整局分圈条 + 在场/按键/提醒三条时间线。读屏泳道和事件表收着, 点「全部泳道」「事件表」再展开。"""
     # 打包/解包线程做完发回界面线程: zip 路径(解包是那一局的路径), 出错时是异常
     packed = Signal(object)
     unpacked = Signal(object)
@@ -1108,81 +1721,118 @@ class AxisRecorderTab(QWidget):
         self.run = None
         self.media = None
         self.summaries = []
+        self.lap_info = LapInfo()
+        self.moments = []
+        self._moment_times = []
+        self.t = 0.0
         self._listing = None
         self._packing = False
         self._unpacking = False
         self._was_recording = False
         self._refresh_due = REFRESH_TICKS
+        self._last_tick = 0.0
         self.last_feedback = None
         self.packed.connect(self._on_packed)
         self.unpacked.connect(self._on_unpacked)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        # 两行: 上面选哪一局, 下面是这一局的操作。挤在一行时窗口一窄 Qt 就把按钮叠到下拉框上
+        layout.setContentsMargins(12, 8, 12, 10)
+        layout.setSpacing(6)
+        # 一行: 选局(占满) / 分圈按 / 跟随最新 / 刷新 / 打包反馈 / ⋯(打开反馈包、打开文件夹、清空导出原图)
         top = QHBoxLayout()
+        top.setSpacing(6)
         self.run_box = ComboBox()
-        self.run_box.setMinimumWidth(420)
+        self.run_box.setMinimumWidth(280)
         self.run_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.run_box.currentIndexChanged.connect(self._on_run_selected)
-        refresh = PushButton('刷新')
-        refresh.clicked.connect(lambda: self.refresh(force=True))
-        folder = PushButton('打开文件夹')
-        folder.clicked.connect(self._open_folder)
-        self.import_button = PushButton('打开反馈包')
-        self.import_button.clicked.connect(self._open_feedback)
-        self.import_button.setToolTip('选别人发来的反馈包 zip, 解压到记录目录下的 imported 文件夹(只留最近 10 个)直接打开看,\n'
-                                      '和本地记录分开放, 开新局时不会被删')
-        self.pack_button = PushButton('打包反馈')
-        self.pack_button.clicked.connect(self._pack_feedback)
-        self.clear_button = PushButton('清空导出原图')
-        self.clear_button.clicked.connect(self._clear_exports)
-        self.follow = CheckBox('跟随最新一局')
-        self.follow.setChecked(True)
         self.lap_box = ComboBox()
-        self.lap_box.setMinimumWidth(130)
+        self.lap_box.setMinimumWidth(110)
+        self.lap_box.setToolTip('按哪个角色上场切圈: 整局进度条、画面左上角的第几圈、分圈对比都按这个')
         self.lap_box.currentIndexChanged.connect(self._on_lap_changed)
-        self.zoom = Slider(Qt.Horizontal)
-        self.zoom.setRange(5, 600)
-        self.zoom.setValue(60)
-        self.zoom.setFixedWidth(140)
-        self.zoom.valueChanged.connect(lambda v: self.canvas.set_zoom(float(v)))
-        # 按钮和勾选框按自己的字宽固定, 窄了只缩下拉框(它按最长那一项要宽度, 不固定的话会把旁边的字挤掉)
-        for widget in (self.follow, refresh, folder, self.import_button, self.pack_button, self.clear_button):
+        self.follow = CheckBox('跟随最新')
+        self.follow.setChecked(True)
+        self.follow.setToolTip('打完一局自动切到最新那一局')
+        refresh = PushButton('', icon='refresh')
+        refresh.setToolTip('刷新记录列表')
+        refresh.clicked.connect(lambda: self.refresh(force=True))
+        self.pack_button = PushButton('打包反馈', variant='tonal')
+        self.pack_button.clicked.connect(self._pack_feedback)
+        self.more_button = PushButton('⋯')
+        self.more_button.setToolTip('打开反馈包、打开文件夹、清空导出原图')
+        self.more_menu = QMenu(self)
+        self.import_action = self.more_menu.addAction('打开反馈包…', self._open_feedback)
+        self.import_action.setToolTip('选别人发来的反馈包 zip, 解压到记录目录下的 imported 文件夹(只留最近 10 个)直接打开看,\n'
+                                      '和本地记录分开放, 开新局时不会被删')
+        self.folder_action = self.more_menu.addAction('打开文件夹', self._open_folder)
+        self.clear_action = self.more_menu.addAction('清空导出原图', self._clear_exports)
+        self.more_menu.setToolTipsVisible(True)
+        self.more_button.clicked.connect(
+            lambda: self.more_menu.exec(self.more_button.mapToGlobal(QPoint(0, self.more_button.height() + 2))))
+        # 按钮和勾选框按自己的字宽固定, 窄了只缩下拉框
+        for widget in (self.follow, refresh, self.pack_button, self.more_button):
             widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         top.addWidget(self.run_box, 1)
-        for widget in (self.follow, refresh, self.import_button):
+        top.addWidget(BodyLabel('分圈按'))
+        for widget in (self.lap_box, self.follow, refresh, self.pack_button, self.more_button):
             top.addWidget(widget)
         layout.addLayout(top)
-        actions = QHBoxLayout()
-        for widget in (BodyLabel('分圈按'), self.lap_box, BodyLabel('缩放'), self.zoom):
-            actions.addWidget(widget)
-        actions.addStretch(1)
-        for widget in (self.pack_button, folder, self.clear_button):
-            actions.addWidget(widget)
-        layout.addLayout(actions)
 
-        # 常驻一行, 队伍/分辨率/按键读屏次数/各角色统计放悬停提示
-        self.summary = BodyLabel()
-        self.summary.setWordWrap(True)
+        # 常驻一行: 总时长、结束原因、分圈; 队伍/分辨率/按键读屏次数/各角色统计放悬停提示
+        self.summary = BodyLabel('', role='secondary')
+        self.summary.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.summary)
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setHandleWidth(8)
-        splitter.setStyleSheet('QSplitter::handle { background: transparent; }')  # 默认是浅色, 深色主题下一道白线
+        # 中间: 画面(主角) | 此刻
+        self.frame_panel = FramePanel()
+        self.frame_panel.stepped.connect(lambda t: self._set_time(t, 'step'))
+        self.frame_panel.eventStep.connect(self._step_event)
+        self.frame_panel.playToggled.connect(self._toggle_play)
+        self.now_panel = NowPanel()
+        self.now_panel.setMinimumWidth(240)
+        self.now_panel.drawerToggled.connect(self._toggle_drawer)
+        self.now_panel.lanesToggled.connect(self._toggle_lanes)
+        stage = QSplitter(Qt.Horizontal)
+        stage.setHandleWidth(10)
+        stage.setStyleSheet('QSplitter::handle { background: transparent; }')  # 默认是浅色, 深色主题下一道白线
+        stage.addWidget(self.frame_panel)
+        stage.addWidget(self.now_panel)
+        stage.setStretchFactor(0, 1)
+        stage.setStretchFactor(1, 0)
+        stage.setCollapsible(0, False)
+        stage.setSizes([880, 300])
+
+        # 底下「进度」: 整局一条 + 时间线
+        self.progress = Card()
+        progress_layout = QVBoxLayout(self.progress)
+        progress_layout.setContentsMargins(0, 8, 10, 6)
+        progress_layout.setSpacing(4)
+        strip_row = QHBoxLayout()
+        strip_row.setSpacing(0)
+        whole = BodyLabel('整局', role='caption')
+        whole.setFixedWidth(COMPACT_LABEL_W)
+        whole.setContentsMargins(8, 0, 0, 0)
+        strip_row.addWidget(whole)
+        self.lap_strip = LapStrip()
+        self.lap_strip.timePicked.connect(self._on_strip_picked)
+        strip_row.addWidget(self.lap_strip, 1)
+        progress_layout.addLayout(strip_row)
         self.scroll = ScrollArea()
         self.scroll.setWidgetResizable(False)
         self.scroll.setFrameShape(QFrame.NoFrame)
         self.scroll.setStyleSheet('QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }')
         self.canvas = TimelineCanvas(self.scroll)
         self.scroll.setWidget(self.canvas)
-        self.canvas.timeClicked.connect(self._on_time_clicked)
-        splitter.addWidget(self.scroll)
+        self.canvas.timeClicked.connect(lambda t: self._set_time(t, 'canvas'))
+        self.canvas.timeDragged.connect(lambda t: self._set_time(t, 'drag'))
+        self.canvas.eventClicked.connect(self.now_panel.show_event)
+        self.canvas.viewChanged.connect(self.lap_strip.set_view)
+        progress_layout.addWidget(self.scroll, 1)
 
-        bottom = QWidget()
-        bottom_layout = QVBoxLayout(bottom)
-        bottom_layout.setContentsMargins(0, 6, 0, 0)
+        # 收着的: 事件表(能过滤) / 分圈对比
+        self.drawer = QWidget()
+        bottom_layout = QVBoxLayout(self.drawer)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
         bar = QHBoxLayout()
         self.pages = QStackedWidget()
         if SegmentedWidget is not None:
@@ -1237,29 +1887,34 @@ class AxisRecorderTab(QWidget):
         self.lap_table.cellClicked.connect(self._on_lap_cell)
         lap_layout.addWidget(self.lap_table, 1)
         self.pages.addWidget(lap_page)
+        self.drawer.setVisible(False)
 
-        splitter.addWidget(bottom)
-        splitter.setSizes([420, 260])
+        self.vsplit = QSplitter(Qt.Vertical)
+        self.vsplit.setHandleWidth(8)
+        self.vsplit.setStyleSheet('QSplitter::handle { background: transparent; }')
+        for widget in (stage, self.progress, self.drawer):
+            self.vsplit.addWidget(widget)
+        self.vsplit.setCollapsible(0, False)
+        self.vsplit.setCollapsible(1, False)
+        self.vsplit.setStretchFactor(0, 1)
+        self.vsplit.setStretchFactor(1, 0)
+        layout.addWidget(self.vsplit, 1)
 
-        # 画面占右边一整列: 放在下半截就只剩一百多像素高
-        self.frame_panel = FramePanel()
-        self.frame_panel.stepped.connect(self._on_frame_step)
-        self.canvas.eventClicked.connect(self.frame_panel.show_event)
-        self.canvas.timeDragged.connect(self.frame_panel.show_time)
-        main = QSplitter(Qt.Horizontal)
-        main.setHandleWidth(8)
-        main.setStyleSheet('QSplitter::handle { background: transparent; }')
-        main.addWidget(splitter)
-        main.addWidget(self.frame_panel)
-        main.setStretchFactor(0, 3)
-        main.setStretchFactor(1, 2)
-        main.setSizes([1000, 480])
-        layout.addWidget(main, 1)
+        # 空格播放/暂停, ←/→ 上一帧/下一帧(焦点在过滤框里打字时不抢)
+        for key, slot in ((Qt.Key_Space, self._toggle_play), (Qt.Key_Left, lambda: self.frame_panel.step(-1)),
+                          (Qt.Key_Right, lambda: self.frame_panel.step(1))):
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(slot)
 
+        self.play_timer = QTimer(self)
+        self.play_timer.setInterval(PLAY_MS)
+        self.play_timer.timeout.connect(self._play_tick)
         self.timer = QTimer(self)
         self.timer.setInterval(TICK_MS)
         self.timer.timeout.connect(self._tick)
         self.timer.start()
+        self._fit_progress()
         self.refresh(force=True)
 
     # ---------- 数据 ----------
@@ -1335,6 +1990,7 @@ class AxisRecorderTab(QWidget):
             self.load(None)
 
     def load(self, path):
+        self._stop_play()
         error = None
         try:
             self.run = RunData(path) if path else None
@@ -1347,9 +2003,15 @@ class AxisRecorderTab(QWidget):
             except Exception:
                 self.media = None
         self._fill_lap_box()
+        self.lap_info = LapInfo(self.run, self.lap_box.currentData()) if self.run is not None else LapInfo()
+        self.moments = build_moments(self.run) if self.run is not None else []
+        self._moment_times = [m[0] for m in self.moments]
         self.canvas.set_run(self.run)
+        self.lap_strip.set_run(self.run, self.lap_info)
         self.model.set_run(self.run)
         self.frame_panel.set_run(self.run, self.media)
+        self.now_panel.set_run(self.run, self.media, self.moments)
+        self._fit_progress()
         for column, width in enumerate((80, 150, 64, 520)):
             self.table.setColumnWidth(column, width)
         self._update_summary()
@@ -1357,6 +2019,9 @@ class AxisRecorderTab(QWidget):
             self.summary.setText(f'读不了这份记录: {error}')
         self._fill_lap_table()
         self._update_pack_button()
+        self.t = 0.0
+        if self.run is not None:
+            self._set_time(0.0, 'load')
 
     def _fill_lap_box(self):
         self.lap_box.blockSignals(True)
@@ -1473,18 +2138,82 @@ class AxisRecorderTab(QWidget):
     def _on_lap_changed(self, _index):
         if self.run is not None:
             self._save_pref(self.lap_box.currentData())
+        self.lap_info = LapInfo(self.run, self.lap_box.currentData()) if self.run is not None else LapInfo()
+        self.lap_strip.set_run(self.run, self.lap_info)
         self._update_summary()
         self._fill_lap_table()
+        if self.run is not None:
+            self.frame_panel.set_overlay(self._overlay_at(self.t))
 
     def _on_lap_cell(self, row, column):
         item = self.lap_table.item(row, column)
         t = item.data(Qt.UserRole) if item is not None else None
         if t is not None:
             self.canvas.center_on(t)
-            self._on_time_clicked(t)
+            self._set_time(t, 'row')
 
-    def _on_time_clicked(self, t):
+    def _on_row_clicked(self, index):
+        row = self.proxy.mapToSource(index).row()
+        if 0 <= row < len(self.model.rows):
+            t = self.model.rows[row][0]
+            self.canvas.center_on(t)
+            self._set_time(t, 'row')
+            self.now_panel.show_event(self.model.events[row])
+
+    def _on_strip_picked(self, t):
+        self._set_time(t, 'strip')
+
+    # ---------- 光标 ----------
+
+    def _set_time(self, t, source=None):
+        """光标挪到 t: 时间线红线、画面、左上角信息、此刻、整局条一起跟。
+        source: canvas/drag 是时间线自己挪了红线; play/step/strip/event/load 要把红线滚进视野;
+        拖动、播放、点表格行时不去对表格(点行时对的话同一时刻的几行会跳来跳去)。"""
+        if self.run is None:
+            return
+        t = max(0.0, min(self.run.duration, t))
+        self.t = t
+        if source not in ('canvas', 'drag'):
+            self.canvas.set_cursor(t)
+            if source in ('play', 'step', 'strip', 'event', 'load'):
+                self.canvas.ensure_visible(t)
         self.frame_panel.show_time(t)
+        self.frame_panel.set_overlay(self._overlay_at(t))
+        self.now_panel.show_time(t)
+        self.lap_strip.set_cursor(t)
+        if source not in ('play', 'drag', 'row') and self.drawer.isVisible():
+            self._sync_table(t)
+
+    def _overlay_at(self, t):
+        """画面左上角那块: 第几圈 + 时间 / 谁在场、这一段到现在多久、这一段一共多久(分了圈再给同顺序几圈的中位数) /
+        按住什么键、按了多久。"""
+        run, info = self.run, self.lap_info
+        lap = info.lap_at(t)
+        title = ''
+        if lap is not None:
+            title = '开场' if lap < 0 else ('收尾' if lap >= len(info.laps) else f'第 {lap + 1} 圈')
+        overlay = {'title': title, 'time': f'{t:.3f}s'}
+        span = run.span_at(t)
+        if span is not None:
+            color = HIDDEN_COLOR if span.value == HUD_HIDDEN else SLOT_COLORS[span.value % len(SLOT_COLORS)]
+            segment = info.segment_at(lap, t) if span.certain else None
+            if segment is not None:
+                t0, duration, median = segment
+                text = f'本段 {t - t0:.2f}s / {duration:.2f}s' + (f' · 中位 {median:.2f}' if median is not None else '')
+            else:
+                text = f'本段 {t - span.t0:.2f}s / {span.t1 - span.t0:.2f}s'
+            overlay['field'] = (span.label, color, text)
+        for hold in run.holds:
+            if hold.t0 > t:
+                break
+            if t < hold.t1:
+                duration = hold.t1 - hold.t0
+                overlay['hold'] = (hold.label.replace('(没松)', ''), (t - hold.t0) / duration if duration else 1.0,
+                                   f'{t - hold.t0:.2f}s / {duration:.2f}s')
+                break
+        return overlay
+
+    def _sync_table(self, t):
         row = self.model.row_near(t)
         if row < 0:
             return
@@ -1493,17 +2222,85 @@ class AxisRecorderTab(QWidget):
             self.table.selectRow(index.row())
             self.table.scrollTo(index, QAbstractItemView.PositionAtCenter)
 
-    def _on_frame_step(self, t):
-        self.canvas.center_on(t)
-        self._on_time_clicked(t)
+    def _step_event(self, delta):
+        """跳到上/下一个事件(切人上场、按键、松开按住的键、打点)。"""
+        times = self._moment_times if self.run is not None else []
+        if not times:
+            return
+        if delta > 0:
+            i = bisect.bisect_right(times, self.t + 0.0005)
+            if i < len(times):
+                self._set_time(times[i], 'event')
+        else:
+            i = bisect.bisect_left(times, self.t - 0.0005) - 1
+            if i >= 0:
+                self._set_time(times[i], 'event')
 
-    def _on_row_clicked(self, index):
-        row = self.proxy.mapToSource(index).row()
-        if 0 <= row < len(self.model.rows):
-            t = self.model.rows[row][0]
-            self.canvas.center_on(t)
-            self.frame_panel.show_time(t)
-            self.frame_panel.show_event(self.model.events[row])
+    # ---------- 播放 ----------
+
+    def _toggle_play(self):
+        if self.play_timer.isActive():
+            self._stop_play()
+            return
+        if self.run is None:
+            return
+        if self.t >= self.run.duration - 0.01:
+            self.t = 0.0
+        self._last_tick = time.monotonic()
+        self.play_timer.start()
+        self.frame_panel.set_playing(True)
+
+    def _stop_play(self):
+        self.play_timer.stop()
+        self.frame_panel.set_playing(False)
+
+    def _play_tick(self):
+        if self.run is None:
+            self._stop_play()
+            return
+        now = time.monotonic()
+        t = self.t + (now - self._last_tick) * self.frame_panel.speed
+        self._last_tick = now
+        if t >= self.run.duration:
+            t = self.run.duration
+            self._stop_play()
+        self._set_time(t, 'play')
+
+    # ---------- 展开 / 收起 ----------
+
+    def _fit_progress(self):
+        """进度区平时刚好装下三条时间线(高度固定); 全部泳道时能往上拖高。"""
+        height = self.canvas.content_height() + self.scroll.horizontalScrollBar().sizeHint().height() + 2
+        self.scroll.setMinimumHeight(min(height, 200) if self.canvas.full else height)
+        self.scroll.setMaximumHeight(height)
+        margins = self.progress.layout().contentsMargins()
+        spacing = self.progress.layout().spacing()
+        card = margins.top() + margins.bottom() + self.lap_strip.height() + spacing + height
+        self.progress.setMaximumHeight(card)
+
+    def _toggle_lanes(self, on):
+        self.canvas.set_full(on)
+        self._fit_progress()
+        sizes = self.vsplit.sizes()
+        total = sum(sizes)
+        if on:
+            want = min(self.canvas.content_height() + 60, int(total * 0.5))
+        else:
+            want = self.progress.maximumHeight()  # 收回三条, 空出来的高度还给画面
+        sizes[0] = max(220, total - want - sizes[2])
+        sizes[1] = total - sizes[0] - sizes[2]
+        self.vsplit.setSizes(sizes)
+        self.now_panel.show_time(self.t)  # 「看全部泳道」那行字跟着变
+
+    def _toggle_drawer(self, on):
+        self.drawer.setVisible(on)
+        if on:
+            sizes = self.vsplit.sizes()
+            total = sum(sizes)
+            sizes[2] = max(220, int(total * 0.35))
+            sizes[0] = max(200, total - sizes[1] - sizes[2])
+            self.vsplit.setSizes(sizes)
+            self._sync_table(self.t)
 
     def _open_folder(self):
         # 看的是导入的反馈包就打开那个包解出来的文件夹(反馈说明、日志都在里面)
@@ -1528,8 +2325,8 @@ class AxisRecorderTab(QWidget):
         prefs['_import_dir'] = os.path.dirname(path)
         self._write_prefs(prefs)
         self._unpacking = True
-        self.import_button.setEnabled(False)
-        self.import_button.setText('解压中…')
+        self.import_action.setEnabled(False)
+        self.import_action.setText('解压中…')
         threading.Thread(target=self._unpack_worker, args=(path,), name='axis_recorder_import', daemon=True).start()
 
     def _unpack_worker(self, path):
@@ -1544,8 +2341,8 @@ class AxisRecorderTab(QWidget):
 
     def _on_unpacked(self, result):
         self._unpacking = False
-        self.import_button.setEnabled(True)
-        self.import_button.setText('打开反馈包')
+        self.import_action.setEnabled(True)
+        self.import_action.setText('打开反馈包…')
         if isinstance(result, Exception):
             self._toast('error', '打不开这个反馈包', str(result))
             return
@@ -1560,10 +2357,10 @@ class AxisRecorderTab(QWidget):
     def _update_export_button(self):
         count, size = export_usage(self.out_dir)
         text = f'清空导出原图 ({count} 次 · {size / 1e6:.0f}MB)' if count else '清空导出原图'
-        if self.clear_button.text() != text:
-            self.clear_button.setText(text)
-        self.clear_button.setEnabled(bool(count))
-        self.clear_button.setToolTip(f'F8 导出的原图在 {os.path.join(self.out_dir, EXPORT_DIR)}\n'
+        if self.clear_action.text() != text:
+            self.clear_action.setText(text)
+        self.clear_action.setEnabled(bool(count))
+        self.clear_action.setToolTip(f'F8 导出的原图在 {os.path.join(self.out_dir, EXPORT_DIR)}\n'
                                      '平时自动只留最近 20 次; 这里一次删光(正在导出的那次不动)')
 
     def _confirm(self, title, text):
@@ -1736,3 +2533,4 @@ class AxisRecorderTab(QWidget):
 
     def dispose(self):
         self.timer.stop()
+        self.play_timer.stop()
