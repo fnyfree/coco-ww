@@ -30,6 +30,8 @@ WIDE_MODE_UI_SCALE = 0.75
 # 编队界面的判据。team_close 是可交互按钮, 鼠标悬停时会放大变形, 匹配分数掉到 0.62;
 # team_start_challenge 在同一帧不随悬停变化, 且下一步本来就要点它。
 TEAM_SCREEN_FEATURES = ('team_start_challenge', 'team_close')
+# 队伍 HUD「不在」要一直有人看着才连成一段: 两次看到不在隔了这么久 (中间没人看), 从后一次重新算。见 note_team_hud
+TEAM_HUD_GAP = 5.0
 # 素材获取列表里的一行 Boss：OCR 名字、名字框顶的 y 占比、这一行自己的按钮框(没有为 None)、是否梦魇聚落、
 # 按钮种类('go' 前往 / 'challenge' 直接挑战 / None 只认出按钮形状)
 BookRow = namedtuple('BookRow', 'name y btn nest kind')
@@ -41,6 +43,8 @@ BookPage = namedtuple('BookPage', 'rows sig text_ys')
 
 class BaseWWTask(BaseTask):
     map_zoomed = False
+    # 最近一次看到队伍 HUD 在 / 这一段「不在」从哪一帧起 / 最近一次看到不在, 都是画面截下来的时刻。见 note_team_hud
+    team_hud = (0.0, 0.0, 0.0)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -951,9 +955,31 @@ class BaseWWTask(BaseTask):
                 exist_count += 1
         if exist_count == 2 or exist_count == 1:
             self.logged_in = True
+            self.note_team_hud(True)
             return True, current, exist_count + 1
         else:
+            self.note_team_hud(False)
             return False, -1, exist_count + 1
+
+    def note_team_hud(self, visible):
+        """记下这一帧队伍 HUD 在不在 (team_hud), 按画面是哪一刻截的算, 同一帧读几遍只算一次。
+
+        给持宏队伍的 HUD 看门狗用 (MacroKit.macro_mark): 宏跑着的时候框架不判脱战, 打进结算画面只能看 HUD 连续多久不在。
+        谁读的 in_team 都算, 队伍代码自己的等待循环也算: 11-27 实机两局打进奇点扩张结算画面, 宏都卡在队伍自己的循环里,
+        只算 MacroKit 自己读的那几次, 看门狗要晚好几秒才开始算, 有时一直接不上。
+        「不在」要连成一段: 中间看到过在, 或者跟上一次看到不在隔了 TEAM_HUD_GAP 秒以上 (中间没人看), 都从这一帧重新算。
+        """
+        at = getattr(getattr(self, 'executor', None), '_last_frame_time', None)
+        if at is None:
+            at = time.time()
+        seen, missing, gone = self.team_hud
+        if visible:
+            if at > seen:
+                self.team_hud = (at, missing, gone)
+        elif at > gone:
+            if missing <= seen or at - gone > TEAM_HUD_GAP:
+                missing = at
+            self.team_hud = (seen, missing, at)
 
         # Function to check if a component forms a ring
 

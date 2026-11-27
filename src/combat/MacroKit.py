@@ -74,6 +74,7 @@ class MacroKit:
     LIB_* / R_* 大招, BREAK_* 破韧提示, E_RESEND_STEP, PRECHARGE_TO_SWITCH, SKILL_BAR_SETTLE,
     TRACE_SWITCH, UNTRUSTED_CONFIRM, RETRY_HUD_CAP。状态 (macro_t0、macro_marks、holding_attack……)
     在队伍类的 __init__ / reset_state 里初始化。
+    HUD_LOST_ABORT (看门狗: 队伍 HUD 连续多少秒不在就按脱战交回框架) 可以不写, 不写是 16 秒。
     """
 
     def teammate(self, name):
@@ -117,9 +118,52 @@ class MacroKit:
     def macro_start(self):
         self.macro_t0 = time.time()
         self.macro_marks = []
+        # HUD 看门狗 (见 macro_mark) 从第一次开宏算起。很多队每圈开头都会再调一次, 不跟着重新算:
+        # 结算画面上宏还会一圈圈往下跑 (每格卡满超时), 每圈从头算的话一圈不到 16 秒就永远凑不够
+        if getattr(self, 'hud_watch_since', None) is None:
+            self.hud_watch_since = self.macro_t0
+            self.hud_missing_at = 0.0
+            self.hud_gone_at = 0.0
 
     def macro_mark(self, name):
-        self.macro_marks.append(f'{name}@{time.time() - self.macro_t0:.2f}')
+        now = time.time()
+        self.macro_marks.append(f'{name}@{now - self.macro_t0:.2f}')
+        # 【看门狗】宏跑着的时候框架的脱战判定是关着的 (skip_combat_check), 关卡结束、结算画面、窗口没了
+        # 只能宏自己发现: 队伍 HUD 连续 HUD_LOST_ABORT 秒 (队伍类没写就 16 秒) 都看到不在, 就按脱战交回框架,
+        # 别在结算画面上接着按 (11-27 实机: 长离/露帕/布兰特打进奇点扩张结算画面, 按了 86 秒才停)。
+        # 交回用 task.raise_not_in_combat: 框架自己判脱战也走它, 会先看是不是全员阵亡弹了复活框。
+        # 只在打标记时顺手查, 停在满 16 秒之后的第一个标记上; 自己重写了 macro_mark 的队伍照旧用自己的看门狗。
+        since = getattr(self, 'hud_watch_since', None)
+        if since is None:
+            return
+
+        def looked():
+            # (最近一次看到在, 这一段「不在」从哪一刻起, 最近一次看到不在)。coco-ww 的框架记着每一次 in_team 看到的
+            # (BaseWWTask.note_team_hud: 谁读的都算, 队伍代码自己的等待循环也算, 按画面截下来的时刻);
+            # 原版 OKWW 没有, 只有 MacroKit 自己读的 (见 hud_ok)
+            shared = getattr(self.task, 'team_hud', None)
+            if shared is not None:
+                return shared
+            return getattr(self, 'hud_seen_at', 0.0), self.hud_missing_at, self.hud_gone_at
+
+        seen, missing, gone = looked()
+        if now - max(since, seen) < 2.0:
+            return
+        # 一会儿没见到 HUD 了: 一秒内谁都没看过的话, 自己看一眼当前帧, 在就续上
+        if now - max(since, seen, gone) >= 1.0:
+            if self.hud_ok():
+                return
+            seen, missing, gone = looked()
+        # 要亲眼看着「不在」连成一段, 而且刚刚还看到不在。光是很久没人看 HUD 不算
+        # (有的格子整段不读屏, 看门狗只在打标记时看一眼, 一眼可能正好撞上大招演出)
+        if gone <= max(since, seen) or now - gone > 1.0:
+            return
+        # 宏开始之前就不在的, 从宏开始算
+        if now - max(since, missing) < getattr(self, 'HUD_LOST_ABORT', 16.0):
+            return
+        self.hud_watch_since = None
+        self.task.raise_not_in_combat(f'{self.name}: 队伍 HUD {now - max(since, seen):.1f}s 没出现, '
+                                      f'按脱战交回框架 (关卡结束/结算画面/窗口没了?)')
 
     def macro_timeline(self, since=0):
         return ' '.join(self.macro_marks[since:])
@@ -382,6 +426,10 @@ class MacroKit:
                 next_click = now + click_interval
             self.task.next_frame()
             in_team, index, count = self.task.in_team()
+            if in_team:
+                self.hud_seen_at = time.time()   # 看门狗用 (见 macro_mark)
+            else:
+                self.hud_ok()   # 看到不在也记一笔 (原版 OKWW 只有 MacroKit 自己记的), 看门狗从 HUD 刚没那一刻算起
             # 【count 不达标的 index 打折扣, 但不能一票否决】: in_team() 在只找到
             # 一个槽位文本时照样返回 True 和一个 index(那是渲染顺序的产物);
             # 但一票否决会造成假失败 —— 有槽位被特效盖住时 count 就是不达标,
@@ -513,6 +561,10 @@ class MacroKit:
             self.task.send_key(slot, down_time=self.SWITCH_KEY_DOWN_TIME)
             self.task.next_frame()
             in_team, index, count = self.task.in_team()
+            if in_team:
+                self.hud_seen_at = time.time()   # 看门狗用 (见 macro_mark)
+            else:
+                self.hud_ok()   # 看到不在也记一笔 (原版 OKWW 只有 MacroKit 自己记的), 看门狗从 HUD 刚没那一刻算起
             # 只要 HUD 还认为离场角色在场, 这一发技能键就还落在他身上
             if in_team and index == src.index:
                 key_send()
@@ -584,6 +636,10 @@ class MacroKit:
                 last = now
             self.task.next_frame()
             in_team, index, count = self.task.in_team()
+            if in_team:
+                self.hud_seen_at = time.time()   # 看门狗用 (见 macro_mark)
+            else:
+                self.hud_ok()   # 看到不在也记一笔 (原版 OKWW 只有 MacroKit 自己记的), 看门狗从 HUD 刚没那一刻算起
             # 离场角色已经不在 HUD 上了 -> 切人基本已经坐实, 可以开始预输入 R
             if not (in_team and index == source.index):
                 r_open = True
@@ -643,14 +699,14 @@ class MacroKit:
             # 只跟【按键什么时候落下】有关
             if n % self.LIB_READ_EVERY == 0:
                 self.task.next_frame()
-                if not self.task.in_team()[0]:
+                if not self.hud_ok():
                     char.record_liberation_use()
                     self.macro_mark(f'{tag}_fired(x{n})')
                     return True
             self.sleep(self.LIB_KEY_INTERVAL, check_combat=False)
         # 最后再确认一次: 键刚发出去、演出还差一帧才开始的情况很常见
         self.task.next_frame()
-        if not self.task.in_team()[0]:
+        if not self.hud_ok():
             char.record_liberation_use()
             self.macro_mark(f'{tag}_fired(x{n})')
             return True
@@ -696,7 +752,7 @@ class MacroKit:
                 self.click()
                 next_click = now + self.A_INTERVAL
             self.task.next_frame()
-            on_hud = self.task.in_team()[0]
+            on_hud = self.hud_ok()
             if not on_hud:
                 gone_seen = True
                 back_at = None
@@ -748,7 +804,7 @@ class MacroKit:
                 n += 1
                 next_click = now + interval
             self.task.next_frame()
-            if not self.task.in_team()[0]:
+            if not self.hud_ok():
                 gone_seen = True
             elif gone_seen and hud_at is None:
                 hud_at = time.time() - start
@@ -786,7 +842,7 @@ class MacroKit:
                 n += 1
                 next_click = now + self.A_INTERVAL
             self.task.next_frame()
-            if not self.task.in_team()[0]:
+            if not self.hud_ok():
                 gone_seen = True
             elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
                 back = True
@@ -816,6 +872,10 @@ class MacroKit:
         while True:
             self.task.next_frame()   # in_team() 读的是缓存帧, 不刷就是反复读同一张图
             in_team, index, count = self.task.in_team()
+            if in_team:
+                self.hud_seen_at = time.time()   # 看门狗用 (见 macro_mark)
+            else:
+                self.hud_ok()   # 看到不在也记一笔 (原版 OKWW 只有 MacroKit 自己记的), 看门狗从 HUD 刚没那一刻算起
             if in_team and count >= expected:
                 for char in self.task.chars:
                     if char is not None and char.index == index:
@@ -912,7 +972,7 @@ class MacroKit:
         back = False
         while time.time() - start < time_out:
             self.task.next_frame()
-            if not self.task.in_team()[0]:
+            if not self.hud_ok():
                 gone_seen = True
             elif gone_seen or time.time() - start >= self.HUD_NO_ANIM_GRACE:
                 back = True
@@ -961,11 +1021,25 @@ class MacroKit:
         self.macro_wait(deadline - time.time())
 
     def hud_ok(self):
-        """队伍 HUD 在不在(读当前帧)。见到就记下时刻, 给看门狗用。"""
+        """队伍 HUD 在不在(读当前帧)。看到在、看到不在都记下时刻, 给看门狗用 (见 macro_mark)。
+
+        原版 OKWW 上看门狗只看得到这里记的; coco-ww 的框架每次 in_team 都会记 (BaseWWTask.note_team_hud)。
+        """
         ok = bool(self.task.in_team()[0])
+        now = time.time()
         if ok:
-            self.hud_seen_at = time.time()
-        return ok
+            self.hud_seen_at = now
+            return True
+        # 看到不在只认新鲜的画面: 缓存帧可能还停在半秒前的大招演出上 (整段连点不刷新画面)
+        frame_at = getattr(getattr(self.task, 'executor', None), '_last_frame_time', now)
+        if now - frame_at <= 0.5:
+            # 「不在」要连成一段才算: 这之前见过 HUD, 或者跟上一次看到不在隔了 5 秒以上 (中间没人看),
+            # 都从这里重新算
+            if (getattr(self, 'hud_missing_at', 0.0) <= getattr(self, 'hud_seen_at', 0.0)
+                    or now - getattr(self, 'hud_gone_at', 0.0) > 5.0):
+                self.hud_missing_at = now
+            self.hud_gone_at = now
+        return False
 
     def game_foreground(self):
         try:
@@ -1048,7 +1122,7 @@ class MacroKit:
         next_click = 0.0
         while time.time() - start < cap:
             self.task.next_frame()
-            hud = bool(self.task.in_team()[0])
+            hud = self.hud_ok()
             if hud:
                 if available():
                     seen_ready = True
@@ -1186,13 +1260,14 @@ class MacroKit:
                 self.click()
                 next_click = now + self.A_INTERVAL
             self.task.next_frame()
-            self.hud_ok()
-            try:
-                con = self.con_now()
-            except Exception:
-                con = 0.0
-            best = max(best, con)
-            hits = hits + 1 if con >= want else 0
+            # 没 HUD (大招过场、整屏特效) 的帧读不准协奏, 跳过: 不算数, 也不打断连满计数
+            if self.hud_ok():
+                try:
+                    con = self.con_now()
+                except Exception:
+                    con = 0.0
+                best = max(best, con)
+                hits = hits + 1 if con >= want else 0
             if hits >= self.CON_FULL_CONFIRM or time.time() - start >= settle:
                 break
             self.macro_wait(self.CON_POLL)
@@ -1212,7 +1287,12 @@ class MacroKit:
                 self.click()
                 next_click = now + self.A_INTERVAL
             self.task.next_frame()
-            self.hud_ok()
+            # 没 HUD (大招过场、整屏特效) 的帧读不准协奏, 跳过: 不算满, 也不打断连满计数
+            if not self.hud_ok():
+                if len(samples) < self.CON_SAMPLE_MAX:
+                    samples.append(f'{time.time() - start:.2f}:无HUD')
+                self.macro_wait(self.CON_POLL)
+                continue
             try:
                 con = self.con_now()
             except Exception:
@@ -1237,6 +1317,7 @@ class MacroKit:
             return 1.0 if getattr(self, "_con_soft_n", 0) >= self.CON_SOFT_FRAMES and con >= 0.99 else con
         self._con_soft_frame = frame
         ratio = 0.0
+        # 0.985~0.999 只有旧协奏算法 (原版 OKWW v3.8.14 及以前) 读得出来; coco-ww 现在的算法不满时最多 70/72, 不走这段
         if 0.985 <= con < 1.0:
             try:
                 from src.task.BaseCombatTask import con_colors
@@ -1305,7 +1386,12 @@ class MacroKit:
                 clicks += 1
                 next_click = time.time() + self.A_INTERVAL
             self.task.next_frame()
-            self.hud_ok()
+            # 没 HUD (大招过场、整屏特效) 的帧读不准协奏, 跳过: 不算满, 也不打断连满计数
+            if not self.hud_ok():
+                if len(samples) < self.CON_SAMPLE_MAX:
+                    samples.append(f'{time.time() - start:.2f}:无HUD')
+                self.macro_wait(self.CON_POLL)
+                continue
             try:
                 con = self.con_now()
             except Exception:
@@ -1394,7 +1480,7 @@ class MacroKit:
         for i in range(reads):
             self.task.next_frame()
             try:
-                if self.task.in_team()[0] and char.liberation_available():
+                if self.hud_ok() and char.liberation_available():
                     return True
             except Exception:
                 pass
