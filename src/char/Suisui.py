@@ -50,7 +50,8 @@ class Suisui(BaseChar):
             self.cycle_start()
             if not self.has_intro:
                 if self.try_e():
-                    return self.switch_next_char()
+                    # do_perform 等这里返回后会切一次人; 这里再切, 就是从已经不在场的角色又切一次 (搬自 ok-ww 52c2807)
+                    return
             self.click()
             self.cycle_sleep(self.ATTACK_INTERVAL)
         else:

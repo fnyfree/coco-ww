@@ -85,7 +85,8 @@ class TestTravelToNearestWaypoint(unittest.TestCase):
 
         self.assertEqual(near, task.click.call_args_list[0].args[0])
         task.click_box.assert_called_once_with(travel, relative_x=1.5)
-        task.wait_in_team_and_world.assert_called_once()
+        # 传送慢的机器 20 秒不够 (搬自 ok-ww 9ebac70)
+        task.wait_in_team_and_world.assert_called_once_with(time_out=120)
 
     def test_skips_candidate_when_choice_list_is_shown(self):
         task = self.make_task()

@@ -14,7 +14,9 @@ from src.char import BaseChar
 from src.char.BaseChar import SwitchPriority, dot_color, CharPerformTimeout  # noqa
 from src.char.CharFactory import apply_team_char_classes, get_char_by_pos
 from src.combat.CombatCheck import CombatCheck
+from src.task import con_ring
 from src.task.BaseWWTask import isolate_white_text_to_black, binarize_for_matching
+from src.task.con_ring import con_colors, con_hud_visible  # noqa: con_colors 老队伍代码从这里 import
 
 logger = Logger.get_logger(__name__)
 cd_regex = re.compile(r'\d{1,2}\.\d')
@@ -52,7 +54,8 @@ class BaseCombatTask(CombatCheck):
     """基础战斗任务类，封装了游戏"鸣潮"中角色自动化操作的通用逻辑。"""
     CD_OCR_REFERENCE_ASPECT_RATIO = 16 / 9
     hot_key_verified = False  # 热键是否已验证
-    con_full_size = None  # 不同角色协奏值充满时的大小记录
+    # 旧协奏算法记的满环面积。现在的读数不用它, 也不再更新; 留着给直接读它的老队伍代码 (见 count_rings)
+    con_full_size = None
     freeze_durations = []  # 记录冻结/卡肉的持续时间
     if con_full_size is None:
         con_full_size = Config("_con_full_size", {
@@ -329,7 +332,8 @@ class BaseCombatTask(CombatCheck):
         if not travel:
             raise RuntimeError(self.tr('Can not find the travel button'))
         self.click_box(travel, relative_x=1.5)
-        self.wait_in_team_and_world(time_out=20)
+        # 传送慢的机器 20 秒不够, 会在读图途中报超时 (搬自 ok-ww 9ebac70 / #1868)
+        self.wait_in_team_and_world(time_out=120)
         self.sleep(2)
 
     def raise_not_in_combat(self, message):
@@ -1136,6 +1140,10 @@ class BaseCombatTask(CombatCheck):
             self.raise_not_in_combat('combat check not in combat')
 
     def set_key(self, key, box):
+        current_key = self.key_config.get(key)
+        # 用户自己设成鼠标侧键的, 别拿技能图标上认出来的键盖掉 (搬自 ok-ww 072b30c / #1742)
+        if current_key and current_key.lower() in ['mouse4', 'mouse5', 'xbutton1', 'xbutton2']:
+            return
         best = self.find_best_match_in_box(box, ['t', 'e', 'r', 'q'], threshold=0.7)
         logger.debug(f'set_key best match {key}: {best}')
         if best and best.name != self.key_config[key]:
@@ -1288,6 +1296,10 @@ class BaseCombatTask(CombatCheck):
                 if percent > best_percentage:
                     best_percentage = percent
                     best_index = i
+            if not con_hud_visible(box.crop_frame(self.frame)):
+                # 这帧没 HUD (大招过场、整屏特效): 按颜色认的属性不可信, 先不记, 下回再认。
+                # 记错了这个角色整场按错的颜色读协奏, 一直读不满
+                return best_index
             self.get_current_char().ring_index = best_index
             self.log_debug(
                 f'_ensure_ring_index {self.get_current_char()} to {self.get_current_char().ring_index} {con_templates[best_index]}')
@@ -1305,51 +1317,32 @@ class BaseCombatTask(CombatCheck):
     def get_current_con(self):
         """获取当前角色的协奏值百分比。
 
+        按环上被属性色覆盖的角度算, 不用按分辨率标定; 看不到 HUD (大招过场、整屏特效) 读 0。
+        算法和防误判见 src/task/con_ring.py。
+
         Returns:
-            float: 协奏值百分比 (0.0 到 1.0)。
+            float: 协奏值百分比 (0.0 到 1.0)。只有整圈都覆盖时才返回 1。
         """
         box = self.get_con_box()
-        box.confidence = 0
-
-        max_area = 0
-        percent = 0
-        max_is_full = False
         target_index = self._ensure_ring_index()
-
-        cropped = box.crop_frame(self.frame)
-        for i in range(len(con_colors)):
-            if target_index != -1 and i != target_index:
-                continue
-            color_range = con_colors[i]
-            area, is_full = self.count_rings(cropped, color_range,
-                                             1500 / 3840 / 2160 * self.screen_width * self.screen_height)
-            if is_full:
-                max_is_full = is_full
-            if area > max_area:
-                max_area = int(area)
-        if max_is_full:
-            percent = 1
-        if max_is_full:
-            self.con_full_size[str(target_index)] = max_area
-
-        if percent != 1 and self.con_full_size[str(target_index)] > 0:
-            percent = max_area / self.con_full_size[str(target_index)]
-        if not max_is_full and percent >= 1:
-            self.logger.warning(
-                f'is_con_full not full but percent greater than 1, set to 0.99, {percent} {max_is_full}')
-            percent = 0.99
-        if percent > 1:
-            self.logger.error(f'is_con_full percent greater than 1, set to 1, {percent} {max_is_full}')
-            percent = 1
-
+        percent = self.measure_con_arc(box.crop_frame(self.frame), target_index)
         box.confidence = percent
         self.draw_boxes(f'is_con_full_{self}', box)
-        if percent > 1:
-            percent = 1
         return percent
 
+    def measure_con_arc(self, image, ring_index):
+        """协奏框截图 -> 协奏 (0~1)。同上游 v3.8.15 的同名方法, 另加了防误判, 见 src/task/con_ring.py。
+
+        Args:
+            image (numpy.ndarray): 协奏框的 BGR 截图 (``get_con_box``)。
+            ring_index (int): 属性下标, 同 ``con_colors`` / ``Elements``。
+        """
+        return con_ring.measure_con_arc(image, ring_index)
+
     def count_rings(self, image, color_range, min_area):
-        """在指定图像区域内计算特定颜色范围的能量环数量和状态。
+        """旧协奏算法: 在指定图像区域内计算特定颜色范围的能量环数量和状态。
+
+        get_current_con 已经不用它了。留着给直接调它的老队伍代码 (配合 con_full_size 算面积比)。
 
         Args:
             image (numpy.ndarray): 要分析的图像 (通常是协奏值UI区域的截图)。
@@ -1455,39 +1448,6 @@ white_color = {  # 用于检测UI元素可用状态的白色颜色范围。
     'g': (253, 255),  # Green range
     'b': (253, 255)  # Blue range
 }
-
-con_colors = [  # 不同角色属性的协奏值能量环的颜色范围列表。
-    {
-        'r': (205, 235),
-        'g': (190, 222),  # for yellow spectro
-        'b': (90, 130)
-    },
-    {
-        'r': (150, 190),  # Red range
-        'g': (95, 140),  # Green range for purple electric
-        'b': (210, 249)  # Blue range
-    },
-    {
-        'r': (200, 230),  # Red range
-        'g': (100, 130),  # Green range    for red fire
-        'b': (75, 105)  # Blue range
-    },
-    {
-        'r': (60, 95),  # Red range
-        'g': (150, 180),  # Green range    for blue ice
-        'b': (210, 245)  # Blue range
-    },
-    {
-        'r': (70, 110),  # Red range
-        'g': (215, 250),  # Green range    for green wind
-        'b': (155, 190)  # Blue range
-    },
-    {
-        'r': (190, 220),  # Red range
-        'g': (65, 105),  # Green range    for havoc
-        'b': (145, 175)  # Blue range
-    }
-]
 
 con_templates = [  # 协奏值能量环的模板名称列表 (对应 `con_colors`)。
     'con_spectro',

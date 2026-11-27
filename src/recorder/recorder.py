@@ -500,7 +500,7 @@ class Recorder:
     # ---------- 调用位置 ----------
 
     def classify(self, filename):
-        """ok: 框架库; plumb: 判脱战/找怪/场景缓存; fw: 其它框架代码; base: 角色基类; char: 角色和队伍代码。"""
+        """ok: 框架库; plumb: 判脱战/找怪/场景缓存; fw: 其它框架代码; base: 角色基类和持宏引擎; char: 角色和队伍代码。"""
         if filename.startswith('<'):
             return 'skip'
         path = _norm(filename)
@@ -513,6 +513,10 @@ class Recorder:
             base = os.path.basename(path)
             return 'base' if base in ('basechar.py', 'charfactory.py', '__init__.py') else 'char'
         if path.startswith(paths['plumb']) or path.startswith(paths['scene']):
+            # 持宏引擎 MacroKit 也在 src/combat 下, 但它是持宏队伍代码的基类, 跟 BaseChar 一样算经由。
+            # 算成 plumb 的话, 持宏队伍经它读的协奏、冷却都会当成判脱战的读屏丢掉, 也存不到协奏框原图
+            if os.path.basename(path).lower() == 'macrokit.py':
+                return 'base'
             return 'plumb'
         if path.startswith(paths['src']):
             return 'fw'
@@ -827,6 +831,9 @@ class Recorder:
                             box = _feature_search_box(task, info[0], args, kwargs)
                             if box is not None:
                                 info = (info[0], box) + info[2:]
+                        elif info[1] is None and kind == 'con':
+                            # 协奏读的是 get_con_box 那块 (调用时不传框): 记上框, 读数变了也存那块原图
+                            info = (info[0], _box(task.get_con_box())) + info[2:]
                         recorder.queue.put((_READ, run, t, kind) + info + (where,))
                         sink = recorder.sink
                         if sink is not None and sink.crops:
